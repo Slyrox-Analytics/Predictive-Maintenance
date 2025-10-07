@@ -6,8 +6,6 @@ import streamlit as st
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, ArrowStyle
-from matplotlib import patheffects
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
@@ -19,14 +17,19 @@ EQUIPMENTS = {
 
 # ---------------- CSV-SPALTEN (feste Reihenfolge) ----------------
 CSV_COLUMNS_TS = ["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
-CSV_COLUMNS_ALERTS = ["ts","equipment_id","source","level","metric","value","note"]
-CSV_COLUMNS_EVENTS = ["ts","equipment_id","record_type","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm","source","level","metric","value","note"]
+CSV_COLUMNS_ALERTS_INTERNAL = ["ts","equipment_id","source","level","metric","value","note"]   # interner Speicher
+CSV_COLUMNS_ALERTS_DE = ["ts","equipment_id","quelle","stufe","merkmal","wert","notiz"]       # Export (deutsch)
+CSV_COLUMNS_EVENTS = [
+    "ts","equipment_id","typ",
+    "temperature_c","vibration_rms","current_a","voltage_v","fan_rpm",
+    "quelle","stufe","merkmal","wert","notiz"
+]
 
 # ---------------- STATE ----------------
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(columns=CSV_COLUMNS_TS)
 if "alarms" not in st.session_state:
-    # list of dicts: keys = CSV_COLUMNS_ALERTS
+    # list of dicts mit Keys: ts, equipment_id, source, level, metric, value, note
     st.session_state.alarms = []
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -35,7 +38,7 @@ if "faults" not in st.session_state:
 if "eq_num" not in st.session_state:
     st.session_state.eq_num = "10109812-01"  # Default
 
-# Default thresholds
+# ---------------- SCHWELLWERTE ----------------
 THRESHOLDS = {
     "temperature_c": {"warn": 60.0,  "alert": 70.0},   # °C
     "vibration_rms": {"warn": 0.60,  "alert": 0.80},   # RMS
@@ -118,24 +121,47 @@ with tab_settings:
 
     st.markdown("---")
     st.subheader("KI-Anomalie (IsolationForest)")
-    st.caption("Die KI bewertet den neuesten Punkt im Fenster gegen das erlernte Normalverhalten.")
+
+    # >>> Deine Erklärung 1:1 <<<
+    st.markdown(
+        """
+**Fensterprinzip (Bewertung):**
+- Die KI betrachtet ein Fenster der letzten Messwerte (z. B. 600).
+- Jeder Messwert besteht aus Temperatur, Strom, Spannung, Vibration und Lüfter.
+- Aus den 599 vergangenen Punkten lernt sie das **normale Verhalten**.
+- Den neuesten (600.) vergleicht sie damit:
+  - passt er ins Muster → **normal**
+  - weicht er stark ab → **Anomalie**
+
+**IsolationForest-Erklärung:**
+- **Name:** „Isolation“ = etwas isolieren, „Forest“ = viele kleine Entscheidungsbäume (wie ein Wald).
+- **Idee:** Statt Gemeinsamkeiten zu suchen, trennt der Algorithmus ungewöhnliche Punkte möglichst schnell ab.
+- Er baut viele zufällige Entscheidungsbäume („Forest“).
+- Jeder Baum trennt die Daten nach Zufallsregeln (z. B. „Temperatur < 50 °C?“ → Ja/Nein).
+- **Normale Werte** brauchen viele Trennschritte, bis sie isoliert sind.
+- **Ausreißer** werden sehr schnell isoliert → weil sie nicht ins Muster passen.
+"""
+    )
+
     c1, c2, c3 = st.columns(3)
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
     ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, 0.80, 0.05, key="ml_thresh")
 
-# ---------------- SIMULATOR ----------------
+# ---------------- HILFSFUNKTIONEN ----------------
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
+    # Faults
     if st.session_state.faults.get("cooling"):
         base["temperature_c"] += 0.01 * t
     if st.session_state.faults.get("fan"):
         base["fan_rpm"] -= 0.5 * t
     if st.session_state.faults.get("voltage"):
         base["voltage_v"] += 20 * np.sin(t / 3.0)
+    # Noise
     base["temperature_c"] += np.random.uniform(-0.2, 0.2)
     base["vibration_rms"] += np.random.uniform(-0.02, 0.02)
     base["current_a"]     += np.random.uniform(-2, 2)
@@ -143,15 +169,16 @@ def generate_sample(t: int):
     base["fan_rpm"]       += np.random.uniform(-30, 30)
     return base
 
-def push_alarm(ts, level, source, metric, value, note=""):
+def push_alarm(ts, stufe, quelle, merkmal, wert, notiz=""):
+    """Deutsch beschriftete Alarm-Erfassung (intern gespeichert, Export wird gemappt)."""
     st.session_state.alarms.append({
         "ts": ts,
         "equipment_id": st.session_state.eq_num,
-        "source": source,        # "THRESHOLD" | "ML"
-        "level": level,          # "WARN" | "ALERT"
-        "metric": metric,        # e.g. "temperature_c" | "anomaly_score"
-        "value": round(float(value), 3) if value is not None else None,
-        "note": note
+        "source": quelle,        # intern 'source' -> Export 'quelle'
+        "level": stufe,          # intern 'level'  -> Export 'stufe'
+        "metric": merkmal,       # intern 'metric' -> Export 'merkmal'
+        "value": round(float(wert), 3) if wert is not None else None,  # -> 'wert'
+        "note": notiz            # -> 'notiz'
     })
 
 def check_thresholds(vals, ts):
@@ -159,14 +186,14 @@ def check_thresholds(vals, ts):
         val = float(vals[k])
         if k == "fan_rpm":
             if val < v["alert"]:
-                push_alarm(ts, "ALERT", "THRESHOLD", k, val, "unter Grenzwert alert")
+                push_alarm(ts, "ALERT", "Grenzwert", k, val, "unter Grenzwert (ALERT)")
             elif val < v["warn"]:
-                push_alarm(ts, "WARN", "THRESHOLD", k, val, "unter Grenzwert warn")
+                push_alarm(ts, "WARN", "Grenzwert", k, val, "unter Grenzwert (WARN)")
         else:
             if val > v["alert"]:
-                push_alarm(ts, "ALERT", "THRESHOLD", k, val, "über Grenzwert alert")
+                push_alarm(ts, "ALERT", "Grenzwert", k, val, "über Grenzwert (ALERT)")
             elif val > v["warn"]:
-                push_alarm(ts, "WARN", "THRESHOLD", k, val, "über Grenzwert warn")
+                push_alarm(ts, "WARN", "Grenzwert", k, val, "über Grenzwert (WARN)")
 
 def ml_anomaly(df: pd.DataFrame, window: int, contamination: float):
     if len(df) < window:
@@ -197,6 +224,40 @@ def overall_level(th_levels, ml_score, ml_thresh):
             level = "WARN"
     return level
 
+def build_events_df() -> pd.DataFrame:
+    """Kombinierte Ereignis-Liste (Messpunkt + Alarm) in EINER Tabelle – deutsch."""
+    df_ts = st.session_state.df.reindex(columns=CSV_COLUMNS_TS).copy()
+    df_ts["typ"] = "Messpunkt"
+    df_ts["quelle"] = ""
+    df_ts["stufe"] = ""
+    df_ts["merkmal"] = ""
+    df_ts["wert"] = np.nan
+    df_ts["notiz"] = ""
+
+    df_alerts = pd.DataFrame(st.session_state.alarms)
+    if df_alerts.empty:
+        df_alerts = pd.DataFrame(columns=CSV_COLUMNS_ALERTS_INTERNAL)
+    df_alerts = df_alerts.rename(columns={
+        "source":"quelle",
+        "level":"stufe",
+        "metric":"merkmal",
+        "value":"wert",
+        "note":"notiz"
+    })
+
+    df_alerts_ctx = df_alerts.merge(
+        df_ts[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
+        on=["ts","equipment_id"],
+        how="left"
+    )
+    df_alerts_ctx.insert(2, "typ", "Alarm")
+
+    df_ts_norm = df_ts[CSV_COLUMNS_EVENTS]
+    df_alerts_norm = df_alerts_ctx[CSV_COLUMNS_EVENTS]
+    events = pd.concat([df_ts_norm, df_alerts_norm], ignore_index=True)
+    events = events.sort_values(["ts","typ"]).reset_index(drop=True)
+    return events
+
 # ---------------- LIVE LOOP ----------------
 if st.session_state.running:
     t = len(st.session_state.df)
@@ -210,9 +271,9 @@ if st.session_state.running:
     score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
     if score is not None:
         if score >= ml_alert_thresh:
-            push_alarm(ts, "ALERT", "ML", "anomaly_score", score, f"score>= {ml_alert_thresh}")
+            push_alarm(ts, "ALERT", "KI", "anomaly_score", score, f"Score ≥ {ml_alert_thresh}")
         elif score >= ml_alert_thresh * 0.7:
-            push_alarm(ts, "WARN", "ML", "anomaly_score", score, f"score>= {ml_alert_thresh*0.7:.2f}")
+            push_alarm(ts, "WARN", "KI", "anomaly_score", score, f"Score ≥ {ml_alert_thresh*0.7:.2f}")
 
     status_placeholder.success(f"RUNNING – Last sample @ {ts}")
     time.sleep(1)
@@ -236,12 +297,14 @@ with tab_overview:
             use_container_width=True,
         )
 
-        # Alerts (CSV)
+        # Alerts (CSV, deutsch benannt)
         export_alerts = pd.DataFrame(st.session_state.alarms)
         if export_alerts.empty:
-            export_alerts = pd.DataFrame(columns=CSV_COLUMNS_ALERTS)
-        export_alerts = export_alerts.reindex(columns=CSV_COLUMNS_ALERTS)
-        alerts_csv = export_alerts.to_csv(index=False).encode("utf-8")
+            export_alerts = pd.DataFrame(columns=CSV_COLUMNS_ALERTS_INTERNAL)
+        export_alerts_de = export_alerts.rename(columns={
+            "source":"quelle","level":"stufe","metric":"merkmal","value":"wert","note":"notiz"
+        })[CSV_COLUMNS_ALERTS_DE]
+        alerts_csv = export_alerts_de.to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Export Alerts (CSV)",
             data=alerts_csv,
@@ -250,63 +313,32 @@ with tab_overview:
             use_container_width=True,
         )
 
-        # Events kombiniert (CSV)
-        def build_events_df() -> pd.DataFrame:
-            df_ts = st.session_state.df.reindex(columns=CSV_COLUMNS_TS).copy()
-            df_ts["record_type"] = "MEAS"
-            df_ts["source"] = ""
-            df_ts["level"] = ""
-            df_ts["metric"] = ""
-            df_ts["value"] = np.nan
-            df_ts["note"] = ""
-
-            df_alerts = pd.DataFrame(st.session_state.alarms)
-            if df_alerts.empty:
-                df_alerts = pd.DataFrame(columns=CSV_COLUMNS_ALERTS)
-            df_alerts = df_alerts.reindex(columns=CSV_COLUMNS_ALERTS)
-            # Kontextmesswerte zum gleichen Zeitstempel mergen
-            df_alerts_ctx = df_alerts.merge(
-                df_ts[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
-                on=["ts","equipment_id"],
-                how="left"
-            )
-            df_alerts_ctx.insert(2, "record_type", "ALERT")
-
-            # Reihenfolge vereinheitlichen
-            df_alerts_ctx = df_alerts_ctx.rename(columns={})
-            df_ts_norm = df_ts[CSV_COLUMNS_EVENTS]
-            df_alerts_norm = df_alerts_ctx[CSV_COLUMNS_EVENTS]
-
-            events = pd.concat([df_ts_norm, df_alerts_norm], ignore_index=True)
-            # sortiert nach Zeit, Alerts direkt neben Messungen
-            events = events.sort_values(["ts","record_type"]).reset_index(drop=True)
-            return events
-
+        # Ereignisse kombiniert (CSV)
         events_df = build_events_df()
         events_csv = events_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "⬇️ Export Events kombiniert (CSV)",
+            "⬇️ Export Ereignisse kombiniert (CSV)",
             data=events_csv,
             file_name=f"events_{st.session_state.eq_num}.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
-        # Optional: Excel (Events)
+        # Optional: Excel-Export der Events (falls openpyxl vorhanden)
         try:
-            import openpyxl  # nur falls vorhanden
+            import openpyxl  # noqa: F401
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 events_df.to_excel(writer, index=False, sheet_name="events")
             st.download_button(
-                "⬇️ Export Events (Excel)",
+                "⬇️ Export Ereignisse (Excel)",
                 data=buffer.getvalue(),
                 file_name=f"events_{st.session_state.eq_num}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
         except Exception:
-            pass  # Excel-Button nur anzeigen, wenn openpyxl installiert ist
+            pass
 
     st.subheader("Gesamtzustand")
     if len(st.session_state.df):
@@ -327,14 +359,7 @@ with tab_overview:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
         score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
-        order = {"OK": 0, "WARN": 1, "ALERT": 2}
-        lvl = "OK"
-        for lv in th_levels:
-            if order[lv] > order[lvl]:
-                lvl = lv
-        if score is not None:
-            if score >= ml_alert_thresh: lvl = "ALERT"
-            elif score >= ml_alert_thresh*0.7 and order["WARN"]>order[lvl]: lvl = "WARN"
+        lvl = overall_level(th_levels, score, ml_alert_thresh)
 
         colA, colB = st.columns([1, 3])
         with colA:
@@ -356,48 +381,67 @@ with tab_live:
 with tab_alerts:
     st.subheader("Alarm-Feed (neueste zuerst)")
     if st.session_state.alarms:
-        for a in reversed(st.session_state.alarms[-200:]):
-            badge = st.error if a["level"] == "ALERT" else st.warning
-            badge(f"[{a['ts']}] {a['source']} | {a['metric']}={a['value']} → {a['level']} ({a['note']})")
+        df_view = pd.DataFrame(st.session_state.alarms).rename(columns={
+            "source":"quelle","level":"stufe","metric":"merkmal","value":"wert","note":"notiz"
+        })
+        for _, a in df_view.tail(200).iloc[::-1].iterrows():
+            badge = st.error if a["stufe"] == "ALERT" else st.warning
+            badge(f"[{a['ts']}] {a['quelle']} | {a['merkmal']}={a['wert']} → {a['stufe']} ({a['notiz']})")
     else:
         st.info("Keine Alarme.")
 
 # ---------------- SONSTIGES ----------------
 with tab_misc:
-    st.subheader("Beispiel: Entscheidungsbaum (IsolationForest)")
-    fig, ax = plt.subplots(figsize=(8,4)); ax.axis("off")
+    st.subheader("IsolationForest Prinzip – Normal vs. Anomalie")
 
-    def add_box(ax, xy, text):
-        box = FancyBboxPatch(xy, 0.38, 0.18, boxstyle="round,pad=0.02", fc="#E6F2FF", ec="#3973AC", lw=1.5)
-        ax.add_patch(box)
-        tx = ax.text(xy[0]+0.19, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold")
-        tx.set_path_effects([patheffects.withStroke(linewidth=3, foreground="white")])
+    # Scatter: Temperatur vs. Strom, viele Normale + 1 Anomalie
+    rng = np.random.default_rng(42)
+    n = 150
+    temp_norm = 50 + rng.normal(0, 2.0, n)   # um 50°C
+    curr_norm = 120 + rng.normal(0, 3.0, n)  # um 120A
+    anom_temp = 65.0
+    anom_curr = 120.0
 
-    add_box(ax, (0.05, 0.65), "Temperatur < 50 °C?")
-    add_box(ax, (0.05, 0.30), "Ja → Spannung > 600 V?")
-    add_box(ax, (0.55, 0.30), "Nein → normaler Bereich")
-    add_box(ax, (0.05, 0.02), "Ja → normal")
-    add_box(ax, (0.40, 0.02), "Nein → Ausreißer")
+    fig_sc, ax_sc = plt.subplots(figsize=(8,5))
+    ax_sc.scatter(temp_norm, curr_norm, s=25, label="Normal")
+    ax_sc.scatter([anom_temp],[anom_curr], s=60, marker="x", linewidths=2.5, label="Anomalie")
+    ax_sc.annotate("Anomalie: schnell isolierbar", xy=(anom_temp, anom_curr),
+                   xytext=(anom_temp-7, anom_curr+8),
+                   arrowprops=dict(arrowstyle="->", lw=1.5))
+    ax_sc.set_xlabel("Temperatur (°C)")
+    ax_sc.set_ylabel("Strom (A)")
+    ax_sc.set_title("IsolationForest Prinzip – Normal vs. Anomalie")
+    ax_sc.legend()
+    st.pyplot(fig_sc, use_container_width=True)
 
-    arrow = ArrowStyle("-|>", head_length=1.0, head_width=0.6)
-    ax.annotate("", xy=(0.24,0.39), xytext=(0.24,0.65), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-    ax.annotate("", xy=(0.55,0.39), xytext=(0.24,0.65), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-    ax.annotate("", xy=(0.24,0.11), xytext=(0.24,0.30), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-    ax.annotate("", xy=(0.40,0.11), xytext=(0.24,0.30), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
+    st.markdown("---")
+    st.subheader("Zeitreihe mit Ausreißer")
 
-    st.pyplot(fig, use_container_width=True)
+    # synthetische Reihe mit Ausreißer
+    n = 80
+    x = np.arange(n)
+    y = 45 + 0.2*np.sin(x/4) + np.random.normal(0,0.2,size=n)
+    y[55] = y.mean() + 8.0  # Ausreißer
+
+    fig2, ax2 = plt.subplots(figsize=(10,3))
+    ax2.plot(x, y, linewidth=1.5)
+    ax2.scatter([55],[y[55]], s=80, color="red", zorder=5)
+    ax2.set_xlabel("Zeit (Messpunkte)")
+    ax2.set_ylabel("Temperatur (°C)")
+    ax2.set_title("Temperatur-Verlauf – markierter Ausreißer (rot)")
+    st.pyplot(fig2, use_container_width=True)
 
     st.markdown("---")
     st.subheader("CSV-Strukturen (Vorschau)")
-    events_preview = pd.DataFrame(columns=CSV_COLUMNS_EVENTS) if st.session_state.df.empty and not st.session_state.alarms else None
-    if events_preview is not None:
+    if len(st.session_state.df)==0 and len(st.session_state.alarms)==0:
         base_ts = now_ts()
-        events_preview = pd.DataFrame(
+        preview = pd.DataFrame(
             [
-                {"ts":base_ts,"equipment_id":st.session_state.eq_num,"record_type":"MEAS","temperature_c":45.2,"vibration_rms":0.36,"current_a":121.0,"voltage_v":541.2,"fan_rpm":3180,"source":"","level":"","metric":"","value":np.nan,"note":""},
-                {"ts":base_ts,"equipment_id":st.session_state.eq_num,"record_type":"ALERT","temperature_c":45.2,"vibration_rms":0.36,"current_a":121.0,"voltage_v":602.3,"fan_rpm":3180,"source":"THRESHOLD","level":"WARN","metric":"voltage_v","value":602.3,"note":"über Grenzwert warn"},
+                {"ts":base_ts,"equipment_id":st.session_state.eq_num,"typ":"Messpunkt","temperature_c":45.2,"vibration_rms":0.36,"current_a":121.0,"voltage_v":541.2,"fan_rpm":3180,"quelle":"","stufe":"","merkmal":"","wert":np.nan,"notiz":""},
+                {"ts":base_ts,"equipment_id":st.session_state.eq_num,"typ":"Alarm","temperature_c":45.2,"vibration_rms":0.36,"current_a":121.0,"voltage_v":602.3,"fan_rpm":3180,"quelle":"Grenzwert","stufe":"WARN","merkmal":"voltage_v","wert":602.3,"notiz":"über Grenzwert (WARN)"},
             ]
         )[CSV_COLUMNS_EVENTS]
-        st.dataframe(events_preview, use_container_width=True, hide_index=True)
+        st.dataframe(preview, use_container_width=True, hide_index=True)
     else:
-        st.caption("Die Events-Vorschau entspricht dem kombinierten Export (siehe Overview).")
+        events_prev = build_events_df().tail(10)
+        st.dataframe(events_prev, use_container_width=True, hide_index=True)
