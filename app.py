@@ -8,6 +8,43 @@ from sklearn.ensemble import IsolationForest
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
+# ---------- SAP/Fiori-ähnliches Styling (leicht, unaufdringlich) ----------
+st.markdown("""
+<style>
+:root {
+  --sap-primary: #0a6ed1;   /* SAP Fiori Blau */
+  --sap-warn:    #f0ab00;   /* SAP Warn-Gelb */
+  --sap-alert:   #bb0000;   /* Rot */
+  --sap-ok:      #107e3e;   /* Grün */
+  --sap-text:    #32363a;
+}
+html, body, [class*="css"]  { color: var(--sap-text); }
+h1, h2, h3, h4 { color: var(--sap-primary) !important; }
+section.main > div { padding-top: 0.5rem; }
+
+.stTabs [role="tablist"] { gap: .25rem; }
+.stTabs [role="tab"] { border: 1px solid #e5e7eb; border-bottom: none; background: #f8fafc; }
+.stTabs [aria-selected="true"] { background: white; border-bottom: 2px solid var(--sap-primary); color: var(--sap-primary); }
+
+div[data-testid="stMetricValue"] { color: var(--sap-primary); font-weight: 600; }
+div[data-testid="stMetric"] { border: 1px solid #eef2f7; border-radius: 10px; padding: .5rem .75rem; background: #fbfdff; }
+
+button[kind="secondary"] { border-color: var(--sap-primary) !important; color: var(--sap-primary) !important; }
+.stDownloadButton button { width: 100%; }
+
+blockquote, .legend-box {
+  border-left: 4px solid var(--sap-primary);
+  padding: .5rem .75rem;
+  background: #f4f9ff;
+  border-radius: 6px;
+  margin: .25rem 0 .75rem 0;
+  font-size: 0.95rem;
+}
+.legend-inline { font-size: 0.92rem; margin-top: .25rem; }
+.legend-inline strong { color: var(--sap-primary); }
+</style>
+""", unsafe_allow_html=True)
+
 # ---------------- EQUIPMENT-STAMMDATEN ----------------
 EQUIPMENTS = {
     "10109812-01": {"name": "Gleichrichter XD1", "location": "Schaltschrank 1 – Galvanik Halle (Schüttgutbereich)"},
@@ -23,7 +60,7 @@ NOMINALS = {
         "voltage_v": 540.0,
         "fan_rpm": 3200.0,
     },
-    "10109812-02": {  # XD2 (gleich wie XD1; bei Bedarf später anpassen)
+    "10109812-02": {  # XD2 (identisch; bei Bedarf später separat anpassen)
         "temperature_c": 45.0,
         "vibration_rms": 0.35,
         "current_a": 120.0,
@@ -31,16 +68,14 @@ NOMINALS = {
         "fan_rpm": 3200.0,
     },
 }
-
 def defaults_from_nominals(eq_id: str):
     n = NOMINALS[eq_id]
     return {
-        "temperature_c": {"warn": n["temperature_c"] + 15.0,         "alert": n["temperature_c"] + 25.0},
-        "vibration_rms": {"warn": n["vibration_rms"] + 0.25,          "alert": n["vibration_rms"] + 0.45},
-        "current_a":     {"warn": n["current_a"] * 1.25,              "alert": n["current_a"] * 1.50},
-        "voltage_v":     {"warn": n["voltage_v"] * 1.07,              "alert": n["voltage_v"] * 1.15},
-        # Lüfter = Untergrenze (nach unten!)
-        "fan_rpm":       {"warn": n["fan_rpm"] - 600.0,               "alert": n["fan_rpm"] - 1200.0},
+        "temperature_c": {"warn": n["temperature_c"] + 15.0,  "alert": n["temperature_c"] + 25.0},
+        "vibration_rms": {"warn": n["vibration_rms"] + 0.25,  "alert": n["vibration_rms"] + 0.45},
+        "current_a":     {"warn": n["current_a"] * 1.25,      "alert": n["current_a"] * 1.50},
+        "voltage_v":     {"warn": n["voltage_v"] * 1.07,      "alert": n["voltage_v"] * 1.15},
+        "fan_rpm":       {"warn": n["fan_rpm"] - 600.0,       "alert": n["fan_rpm"] - 1200.0},  # Untergrenze
     }
 
 # ---------------- STATE ----------------
@@ -63,7 +98,6 @@ METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 colL, colR = st.columns([1,1])
 with colL:
     st.markdown("### 🛠️ Predictive Maintenance – Gleichrichter")
-
     eq_num = st.selectbox(
         "EQ-Nummer",
         options=list(EQUIPMENTS.keys()),
@@ -129,8 +163,23 @@ with tab_settings:
         st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],   step=50.0, key="fan_warn")
         st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"],  step=50.0, key="fan_alert")
 
+    # >>> Legende direkt UNTER den Schwellwerten <<<
+    st.markdown(
+        f"""
+<div class="legend-box">
+<b>SOLL &amp; Grenzwerte (für {EQUIPMENTS[st.session_state.eq_num]['name']}):</b><br/>
+- Temperatur: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['temperature_c']:.1f} °C</b> → WARN ab <b>{THRESHOLDS['temperature_c']['warn']:.1f} °C</b>, ALERT ab <b>{THRESHOLDS['temperature_c']['alert']:.1f} °C</b>.<br/>
+- Vibration: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['vibration_rms']:.2f} RMS</b> → WARN ab <b>{THRESHOLDS['vibration_rms']['warn']:.2f}</b>, ALERT ab <b>{THRESHOLDS['vibration_rms']['alert']:.2f}</b>.<br/>
+- Strom: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['current_a']:.0f} A</b> → WARN ab <b>{THRESHOLDS['current_a']['warn']:.0f} A</b>, ALERT ab <b>{THRESHOLDS['current_a']['alert']:.0f} A</b>.<br/>
+- Spannung: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['voltage_v']:.0f} V</b> → WARN ab <b>{THRESHOLDS['voltage_v']['warn']:.0f} V</b>, ALERT ab <b>{THRESHOLDS['voltage_v']['alert']:.0f} V</b>.<br/>
+- Lüfter (Untergrenze): <b>SOLL ~{NOMINALS[st.session_state.eq_num]['fan_rpm']:.0f} RPM</b> → WARN <b>unter {st.session_state.get('fan_warn', THRESHOLDS['fan_rpm']['warn']):.0f}</b>, ALERT <b>unter {st.session_state.get('fan_alert', THRESHOLDS['fan_rpm']['alert']):.0f}</b>.
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
     st.markdown("---")
-    # KI-Erklärung – dein Text bleibt bestehen
+    # KI-Erklärung – Dein Text (unverändert)
     st.subheader("KI-Anomalie (IsolationForest)")
     st.markdown(
         """
@@ -151,7 +200,6 @@ with tab_settings:
 - **Ausreißer** werden sehr schnell isoliert → weil sie nicht ins Muster passen.
 """
     )
-
     c1, c2, c3 = st.columns(3)
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
@@ -178,18 +226,6 @@ with tab_settings:
 • Liegt der Score über dieser Schwelle (z. B. 0.8), wird ein Alarm im Dashboard ausgelöst.
 """)
 
-    st.markdown("---")
-    # Legende: SOLL -> WARN/ALERT für ausgewähltes Gerät
-    n = NOMINALS[st.session_state.eq_num]
-    st.markdown(
-        "**Legende (SOLL & Grenzwerte für das ausgewählte Gerät):**  \n"
-        f"- Temperatur: **SOLL ~{n['temperature_c']} °C** → WARN ab **{THRESHOLDS['temperature_c']['warn']:.1f} °C**, ALERT ab **{THRESHOLDS['temperature_c']['alert']:.1f} °C**.  \n"
-        f"- Vibration: **SOLL ~{n['vibration_rms']:.2f} RMS** → WARN ab **{THRESHOLDS['vibration_rms']['warn']:.2f}**, ALERT ab **{THRESHOLDS['vibration_rms']['alert']:.2f}**.  \n"
-        f"- Strom: **SOLL ~{n['current_a']:.0f} A** → WARN ab **{THRESHOLDS['current_a']['warn']:.0f} A**, ALERT ab **{THRESHOLDS['current_a']['alert']:.0f} A**.  \n"
-        f"- Spannung: **SOLL ~{n['voltage_v']:.0f} V** → WARN ab **{THRESHOLDS['voltage_v']['warn']:.0f} V**, ALERT ab **{THRESHOLDS['voltage_v']['alert']:.0f} V**.  \n"
-        f"- Lüfter: **SOLL ~{n['fan_rpm']:.0f} RPM** → WARN **unter {st.session_state.get('fan_warn', THRESHOLDS['fan_rpm']['warn']):.0f}**, ALERT **unter {st.session_state.get('fan_alert', THRESHOLDS['fan_rpm']['alert']):.0f}**."
-    )
-
 # ---------------- FUNKTIONEN ----------------
 def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
@@ -207,7 +243,6 @@ def push_alarm(ts, level, msg):
     st.session_state.alarms.append({"ts": ts, "level": level, "message": msg})
 
 def check_thresholds(vals, ts):
-    # Nicht-Lüfter: Obergrenzen, Lüfter: Untergrenze
     for k, v in THRESHOLDS.items():
         val = float(vals[k])
         if k == "fan_rpm":
@@ -323,6 +358,7 @@ with tab_overview:
         k4.metric("Spannung (V)", f"{latest['voltage_v']:.1f}")
         k5.metric("Lüfter (RPM)", f"{latest['fan_rpm']:.0f}")
 
+        # Schwellen je Merkmal checken (mit Lüfter-Untergrenze)
         th_levels = []
         for k, v in defaults_from_nominals(st.session_state.eq_num).items():
             val = float(latest[k])
@@ -430,7 +466,6 @@ with tab_misc:
 - Zeile 2 = **ML-ALERT** vom IsolationForest (**Anomalie** erkannt).
 """
     )
-
     preview = build_analysis_df()
     if preview.empty:
         ts1 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
