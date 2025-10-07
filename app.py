@@ -1,4 +1,5 @@
 import time
+import io
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -25,6 +26,7 @@ if "df" not in st.session_state:
         columns=["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
     )
 if "alarms" not in st.session_state:
+    # wir speichern minimal: ts, level, message
     st.session_state.alarms = []
 if "running" not in st.session_state:
     st.session_state.running = False
@@ -69,7 +71,9 @@ with colR:
 st.markdown("---")
 
 # ---------------- TABS ----------------
-tab_overview, tab_live, tab_alerts, tab_settings = st.tabs(["Overview", "Live Charts", "Alerts", "Settings"])
+tab_overview, tab_live, tab_alerts, tab_settings, tab_misc = st.tabs(
+    ["Overview", "Live Charts", "Alerts", "Settings", "Sonstiges"]
+)
 
 # ---------------- SETTINGS ----------------
 with tab_settings:
@@ -115,6 +119,13 @@ with tab_settings:
         i_alert = st.number_input("Strom ALERT (A)", value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
         u_warn  = st.number_input("Spannung WARN (V)", value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
         u_alert = st.number_input("Spannung ALERT (V)", value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
+
+    # Fan-RPM Untergrenzen separat einstellbar (persistieren via session_state)
+    fr1, fr2 = st.columns(2)
+    with fr1:
+        st.session_state.fan_warn = st.number_input("Lüfter WARN (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["warn"], step=50.0, key="fan_warn")
+    with fr2:
+        st.session_state.fan_alert = st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"], step=50.0, key="fan_alert")
 
     st.markdown("---")
     st.subheader("KI-Anomalie (IsolationForest)")
@@ -167,7 +178,7 @@ with tab_settings:
 • Liegt der Score über dieser Schwelle (z. B. 0.8), wird ein Alarm im Dashboard ausgelöst.
 """)
 
-# ---------------- SIMULATOR ----------------
+# ---------------- SIMULATOR & LOGIK ----------------
 def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
     # Faults
@@ -192,9 +203,11 @@ def check_thresholds(vals, ts):
     for k, v in THRESHOLDS.items():
         val = float(vals[k])
         if k == "fan_rpm":
-            if val < v["alert"]:
+            warn_thr = st.session_state.get("fan_warn", THRESHOLDS["fan_rpm"]["warn"])
+            alert_thr = st.session_state.get("fan_alert", THRESHOLDS["fan_rpm"]["alert"])
+            if val < alert_thr:
                 push_alarm(ts, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
-            elif val < v["warn"]:
+            elif val < warn_thr:
                 push_alarm(ts, "WARN", f"{k} niedrig: {val:.1f} RPM")
         else:
             if val > v["alert"]:
@@ -231,12 +244,29 @@ def overall_level(th_levels, ml_score, ml_thresh):
             level = "WARN"
     return level
 
+# --- Analyse-Export: eine Liste (Alarm + Mess-Kontext) ---
+def build_analysis_df():
+    if not st.session_state.alarms:
+        return pd.DataFrame(columns=[
+            "ts","equipment_id","level","message",
+            "temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"
+        ])
+    df_alerts = pd.DataFrame(st.session_state.alarms).copy()
+    df_alerts["equipment_id"] = st.session_state.eq_num
+    df_ts = st.session_state.df.copy()
+    merged = df_alerts.merge(
+        df_ts[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
+        on=["ts","equipment_id"],
+        how="left"
+    )
+    cols = ["ts","equipment_id","level","message","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
+    return merged.reindex(columns=cols)
+
 # ---------------- LIVE LOOP ----------------
 if st.session_state.running:
     t = len(st.session_state.df)
     vals = generate_sample(t)
-    ts = datetime.now().strftime("%H:%M:%S")
-    # equipment_id = aktuell gewählte EQ-Nummer
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = {"ts": ts, "equipment_id": st.session_state.eq_num, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
@@ -260,6 +290,39 @@ else:
 # ---------------- OVERVIEW ----------------
 with tab_overview:
     st.subheader("Gesamtzustand")
+
+    # ---- Export (ein zentrales File) rechts oben ----
+    exp_l, exp_r = st.columns([3,2])
+    with exp_r:
+        analysis_df = build_analysis_df()
+
+        # CSV
+        st.download_button(
+            "⬇️ Export Analyse (CSV)",
+            data=analysis_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"analysis_{st.session_state.eq_num}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_analysis_csv_overview"
+        )
+
+        # Excel (mit openpyxl)
+        try:
+            import openpyxl  # noqa: F401
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                analysis_df.to_excel(writer, index=False, sheet_name="analysis")
+            st.download_button(
+                "⬇️ Export Analyse (Excel)",
+                data=buffer.getvalue(),
+                file_name=f"analysis_{st.session_state.eq_num}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_analysis_xlsx_overview"
+            )
+        except Exception:
+            st.info("Für Excel-Export bitte `openpyxl` in `requirements.txt` ergänzen (z. B. openpyxl==3.1.5).")
+
     if len(st.session_state.df):
         latest = st.session_state.df.iloc[-1]
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
@@ -273,7 +336,9 @@ with tab_overview:
         for k, v in THRESHOLDS.items():
             val = float(latest[k])
             if k == "fan_rpm":
-                th_levels.append("ALERT" if val < v["alert"] else "WARN" if val < v["warn"] else "OK")
+                warn_thr = st.session_state.get("fan_warn", THRESHOLDS["fan_rpm"]["warn"])
+                alert_thr = st.session_state.get("fan_alert", THRESHOLDS["fan_rpm"]["alert"])
+                th_levels.append("ALERT" if val < alert_thr else "WARN" if val < warn_thr else "OK")
             else:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
@@ -307,3 +372,83 @@ with tab_alerts:
                 st.warning(f"[{a['ts']}] {a['message']}")
     else:
         st.info("Keine Alarme.")
+
+# ---------------- SONSTIGES (nur Vorzeigen) ----------------
+with tab_misc:
+    st.subheader("IsolationForest – Normal vs. Anomalie (Illustration)")
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import FancyBboxPatch, ArrowStyle
+
+        # Scatter: Normal vs. Anomalie
+        rng = np.random.default_rng(42)
+        n = 150
+        temp_norm = 50 + rng.normal(0, 2.0, n)
+        curr_norm = 120 + rng.normal(0, 3.0, n)
+        anom_temp, anom_curr = 65.0, 120.0
+
+        fig_sc, ax_sc = plt.subplots(figsize=(8,5))
+        ax_sc.scatter(temp_norm, curr_norm, s=25, label="Normal")
+        ax_sc.scatter([anom_temp],[anom_curr], s=80, marker="x", linewidths=2.5, label="Anomalie")
+        ax_sc.annotate("Anomalie", xy=(anom_temp, anom_curr),
+                       xytext=(anom_temp-7, anom_curr+8),
+                       arrowprops=dict(arrowstyle="->", lw=1.5))
+        ax_sc.set_xlabel("Temperatur (°C)")
+        ax_sc.set_ylabel("Strom (A)")
+        ax_sc.legend()
+        st.pyplot(fig_sc, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Entscheidungsbaum – vereinfachte Logik (nur Illustration)")
+
+        # Kleiner, konsistenter Baum:
+        # Wurzel: Spannung > 600 V? -> Ausreißer
+        # sonst: Temperatur < 50 °C? -> Normal
+        # sonst: Vibration > 0.8 RMS? -> Ausreißer, sonst Normal
+        fig, ax = plt.subplots(figsize=(9,4))
+        ax.axis("off")
+
+        def box(xy, text):
+            b = FancyBboxPatch(xy, 0.36, 0.18, boxstyle="round,pad=0.02", fc="#E6F2FF", ec="#3973AC", lw=1.5)
+            ax.add_patch(b)
+            ax.text(xy[0]+0.18, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold")
+
+        box((0.05, 0.62), "Spannung > 600 V?")
+        box((0.05, 0.32), "Nein → Temp < 50 °C?")
+        box((0.48, 0.62), "Ja → Ausreißer")
+        box((0.05, 0.02), "Ja → Normal")
+        box((0.48, 0.32), "Nein → Vibration > 0.8?")
+        box((0.48, 0.02), "Ja → Ausreißer")
+        box((0.78, 0.02), "Nein → Normal")
+
+        arr = ArrowStyle("-|>", head_length=1.0, head_width=0.6)
+        ax.annotate("", xy=(0.41,0.68), xytext=(0.41,0.68), arrowprops=dict(arrowstyle=arr))  # dummy
+        # Verbindungen
+        ax.annotate("", xy=(0.41,0.41), xytext=(0.23,0.62), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.48,0.70), xytext=(0.23,0.70), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.23,0.11), xytext=(0.23,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.66,0.41), xytext=(0.41,0.41), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.66,0.11), xytext=(0.66,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.83,0.11), xytext=(0.66,0.11), arrowprops=dict(arrowstyle=arr, lw=1.4))
+
+        st.pyplot(fig, use_container_width=True)
+
+    except Exception:
+        st.warning("Matplotlib fehlt – bitte `matplotlib` in `requirements.txt` ergänzen.")
+
+    st.markdown("---")
+    st.subheader("Beispiel-Export (eine Liste – Vorschau)")
+    analysis_preview = build_analysis_df()
+    if analysis_preview.empty:
+        demo_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        demo = pd.DataFrame(
+            [
+                {"ts": demo_ts, "equipment_id": st.session_state.eq_num, "level": "WARN",  "message": "voltage_v hoch: 602.3",
+                 "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 602.3, "fan_rpm": 3180},
+                {"ts": demo_ts, "equipment_id": st.session_state.eq_num, "level": "ALERT", "message": "ML anomaly score=0.86",
+                 "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 541.2, "fan_rpm": 3180},
+            ]
+        )
+        st.dataframe(demo, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(analysis_preview.tail(10), use_container_width=True, hide_index=True)
