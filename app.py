@@ -125,7 +125,7 @@ with tab_settings:
     # >>> Deine Erklärung 1:1 <<<
     st.markdown(
         """
-**Fensterprinzip (Bewertung):**
+
 - Die KI betrachtet ein Fenster der letzten Messwerte (z. B. 600).
 - Jeder Messwert besteht aus Temperatur, Strom, Spannung, Vibration und Lüfter.
 - Aus den 599 vergangenen Punkten lernt sie das **normale Verhalten**.
