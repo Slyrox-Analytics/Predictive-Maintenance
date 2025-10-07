@@ -45,6 +45,26 @@ tab_overview, tab_live, tab_alerts, tab_settings = st.tabs(["Overview", "Live Ch
 
 # ---------------- SETTINGS ----------------
 with tab_settings:
+    # --- Simulation Control (jetzt ganz oben) ---
+    st.subheader("Simulation Control")
+    cstart, cdel = st.columns([2,1])
+    with cstart:
+        if not st.session_state.running:
+            if st.button("▶️ Start Simulation", use_container_width=True):
+                st.session_state.running = True
+                st.experimental_rerun()
+        else:
+            if st.button("⏹ Stop Simulation", use_container_width=True):
+                st.session_state.running = False
+    with cdel:
+        if st.button("🗑️ Daten löschen", help="Löscht NUR Simulationsdaten & Alarmfeed. Einstellungen bleiben erhalten."):
+            st.session_state.df = pd.DataFrame(columns=st.session_state.df.columns)
+            st.session_state.alarms = []
+            st.success("Daten & Alarme gelöscht. Einstellungen unverändert.")
+
+    st.markdown("---")
+
+    # Fault Injection
     st.subheader("Fault Injection (während des Laufs umschaltbar)")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -69,22 +89,11 @@ with tab_settings:
         u_alert = st.number_input("Spannung ALERT (V)", value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
 
     st.markdown("---")
-    st.subheader("Lüfter (RPM) – Untergrenzen")
-    rpm_warn  = st.number_input("RPM WARN (unter)", value=THRESHOLDS["fan_rpm"]["warn"], step=10.0, key="rpm_warn")
-    rpm_alert = st.number_input("RPM ALERT (unter)", value=THRESHOLDS["fan_rpm"]["alert"], step=10.0, key="rpm_alert")
-
-    # write back thresholds
-    THRESHOLDS["temperature_c"]["warn"], THRESHOLDS["temperature_c"]["alert"] = float(t_warn), float(t_alert)
-    THRESHOLDS["vibration_rms"]["warn"], THRESHOLDS["vibration_rms"]["alert"] = float(vib_warn), float(vib_alert)
-    THRESHOLDS["current_a"]["warn"],     THRESHOLDS["current_a"]["alert"]     = float(i_warn),  float(i_alert)
-    THRESHOLOLDS = THRESHOLDS  # no-op, keeps linter calm
-    THRESHOLDS["voltage_v"]["warn"],     THRESHOLDS["voltage_v"]["alert"]     = float(u_warn),  float(u_alert)
-    THRESHOLDS["fan_rpm"]["warn"],       THRESHOLDS["fan_rpm"]["alert"]       = float(rpm_warn),float(rpm_alert)
-
-    st.markdown("---")
     st.subheader("KI-Anomalie (IsolationForest)")
-    # Dein kompakter Block
-    st.markdown("""
+
+    # Deine kurze, feste Erklärung oben
+    st.markdown(
+        """
 **Fensterprinzip (Bewertung):**
 - Die KI betrachtet ein Fenster der letzten Messwerte (z. B. 600).
 - Jeder Messwert besteht aus Temperatur, Strom, Spannung, Vibration und Lüfter.
@@ -95,38 +104,53 @@ with tab_settings:
 
 **IsolationForest-Erklärung:**
 - **Name:** „Isolation“ = etwas isolieren, „Forest“ = viele kleine Entscheidungsbäume (wie ein Wald).
-- **Idee:** Anstatt nach Gemeinsamkeiten zu suchen, versucht der Algorithmus, ungewöhnliche Punkte möglichst schnell „abzuspalten“.
+- **Idee:** Statt Gemeinsamkeiten zu suchen, trennt der Algorithmus ungewöhnliche Punkte möglichst schnell ab.
 - Er baut viele zufällige Entscheidungsbäume („Forest“).
 - Jeder Baum trennt die Daten nach Zufallsregeln (z. B. „Temperatur < 50 °C?“ → Ja/Nein).
 - **Normale Werte** brauchen viele Trennschritte, bis sie isoliert sind.
 - **Ausreißer** werden sehr schnell isoliert → weil sie nicht ins Muster passen.
-""")
+"""
+    )
 
+    # Regler
     c1, c2, c3 = st.columns(3)
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
     ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, 0.80, 0.05, key="ml_thresh")
 
+    # Kurz-Erklärungen direkt UNTER den Reglern (wie gewünscht)
     st.markdown("---")
-    st.subheader("Simulation Control")
-    if not st.session_state.running:
-        if st.button("▶️ Start Simulation", use_container_width=True):
-            st.session_state.running = True
-            st.experimental_rerun()
-    else:
-        if st.button("⏹ Stop Simulation", use_container_width=True):
-            st.session_state.running = False
+    st.markdown("### Erläuterungen zu den Reglern")
+    st.markdown("""
+**Fenstergröße (Punkte)**  
+➡️ Wie viele vergangene Messwerte die KI als Referenz nimmt (z. B. 600 = die letzten 600 Punkte).  
+• Großes Fenster = stabiler, reagiert langsamer.  
+• Kleines Fenster = reagiert schneller, aber empfindlicher.  
+
+**Kontamination (erwartete Ausreißer)**  
+➡️ Erwarteter Anteil an Ausreißern im Normalbetrieb.  
+• Beispiel: 0.02 = 2 % der Punkte dürfen unauffällig abweichen, ohne sofort Alarm auszulösen.  
+• Klein = empfindlicher (erkennt schneller ungewöhnliche Punkte).  
+• Groß = toleranter (meldet nur stärkere Abweichungen).  
+
+**ML-Alert-Schwelle (0–1)**  
+➡️ Ab welchem Anomalie-Score die KI Alarm gibt.  
+• Score nahe 0 = Punkt ist normal.  
+• Score nahe 1 = Punkt ist sehr ungewöhnlich.  
+• Liegt der Score über dieser Schwelle (z. B. 0.8), wird ein Alarm im Dashboard ausgelöst.
+""")
 
 # ---------------- SIMULATOR ----------------
 def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
+    # Faults
     if st.session_state.faults.get("cooling"):
         base["temperature_c"] += 0.01 * t
     if st.session_state.faults.get("fan"):
         base["fan_rpm"] -= 0.5 * t
     if st.session_state.faults.get("voltage"):
         base["voltage_v"] += 20 * np.sin(t / 3.0)
-
+    # Noise
     base["temperature_c"] += np.random.uniform(-0.2, 0.2)
     base["vibration_rms"] += np.random.uniform(-0.02, 0.02)
     base["current_a"]     += np.random.uniform(-2, 2)
@@ -188,7 +212,10 @@ if st.session_state.running:
     row = {"ts": ts, "equipment_id": equipment_id, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
+    # Classical thresholds
     check_thresholds(vals, ts)
+
+    # ML anomaly
     score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
     if score is not None:
         if score >= ml_alert_thresh:
