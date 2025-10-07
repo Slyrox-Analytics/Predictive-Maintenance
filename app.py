@@ -349,6 +349,7 @@ with tab_misc:
         ax_sc.set_ylabel("Strom (A)")
         ax_sc.legend()
         st.pyplot(fig_sc, use_container_width=True)
+        st.caption("Goldene Punkte = normales Betriebsverhalten. Rotes ✗ = Ausreißer (Temperatur deutlich höher, passt nicht ins Muster).")
 
         st.markdown("---")
         st.subheader("Entscheidungsbaum – vereinfachte Logik (Illustration)")
@@ -375,23 +376,42 @@ with tab_misc:
         ax.annotate("", xy=(0.66,0.11), xytext=(0.66,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))  # vib->anomaly
         ax.annotate("", xy=(0.83,0.11), xytext=(0.66,0.11), arrowprops=dict(arrowstyle=arr, lw=1.4))  # vib->normal
         st.pyplot(fig, use_container_width=True)
+        st.caption("Illustration: Erst prüfen wir Spannung (>600 V ⇒ Ausreißer). Sonst Temperatur (<50 °C ⇒ normal). Ansonsten Vibration prüfen (>0.8 ⇒ Ausreißer, sonst normal).")
 
     except Exception:
         st.warning("Matplotlib fehlt – bitte `matplotlib` in requirements.txt ergänzen.")
 
     st.markdown("---")
     st.subheader("Beispiel-Export (eine Liste – Vorschau)")
+
+    # Erklärung zur Tabelle
+    st.markdown(
+        """
+**So liest du die Tabelle:**  
+- Jede Zeile ist **ein Alarm** mit **den Messwerten zum gleichen Zeitpunkt**.  
+- **level** = Stufe (WARN/ALERT), **message** = Grund.  
+- **temperature_c, vibration_rms, current_a, voltage_v, fan_rpm** = Messkontext zur Analyse.
+
+**Beispiel unten:**  
+- Zeile 1 = **Grenzwert-WARN** wegen **Spannung (voltage_v)** über Warn-Grenze.  
+- Zeile 2 = **ML-ALERT** vom IsolationForest (**Anomalie** erkannt).
+"""
+    )
+
+    # Vorschau-Daten realistisch: zwei Events mit unterschiedlichen Zeitstempeln
     preview = build_analysis_df()
     if preview.empty:
-        demo_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts1 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts2 = (datetime.now() + pd.Timedelta(seconds=3)).strftime("%Y-%m-%d %H:%M:%S")
         demo = pd.DataFrame(
             [
-                {"ts": demo_ts, "equipment_id": st.session_state.eq_num, "level": "WARN",  "message": "voltage_v hoch: 602.3",
+                {"ts": ts1, "equipment_id": st.session_state.eq_num, "level": "WARN",  "message": "voltage_v hoch: 602.3",
                  "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 602.3, "fan_rpm": 3180},
-                {"ts": demo_ts, "equipment_id": st.session_state.eq_num, "level": "ALERT", "message": "ML anomaly score=0.86",
+                {"ts": ts2, "equipment_id": st.session_state.eq_num, "level": "ALERT", "message": "ML anomaly score=0.86",
                  "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 541.2, "fan_rpm": 3180},
             ]
         )
         st.dataframe(demo, use_container_width=True, hide_index=True)
     else:
         st.dataframe(preview.tail(10), use_container_width=True, hide_index=True)
+
