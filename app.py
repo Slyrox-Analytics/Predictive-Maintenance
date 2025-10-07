@@ -4,6 +4,9 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, ArrowStyle
+from matplotlib import patheffects
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
@@ -69,7 +72,7 @@ with colR:
 st.markdown("---")
 
 # ---------------- TABS ----------------
-tab_overview, tab_live, tab_alerts, tab_settings = st.tabs(["Overview", "Live Charts", "Alerts", "Settings"])
+tab_overview, tab_live, tab_alerts, tab_settings, tab_misc = st.tabs(["Overview", "Live Charts", "Alerts", "Settings", "Sonstiges"])
 
 # ---------------- SETTINGS ----------------
 with tab_settings:
@@ -236,7 +239,6 @@ if st.session_state.running:
     t = len(st.session_state.df)
     vals = generate_sample(t)
     ts = datetime.now().strftime("%H:%M:%S")
-    # equipment_id = aktuell gewählte EQ-Nummer
     row = {"ts": ts, "equipment_id": st.session_state.eq_num, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
@@ -286,6 +288,16 @@ with tab_overview:
             st.markdown(f"**Health:** {badge}")
         with colB:
             st.caption(f"ML-Score: {score:.2f}" if score is not None else "ML-Score: – (zu wenig Daten)")
+
+        # CSV-Export für Messdaten
+        data_csv = st.session_state.df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Export Messdaten (CSV)",
+            data=data_csv,
+            file_name=f"timeseries_{st.session_state.eq_num}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     else:
         st.info("Noch keine Daten.")
 
@@ -299,7 +311,20 @@ with tab_live:
 # ---------------- ALERTS ----------------
 with tab_alerts:
     st.subheader("Alarm-Feed (neueste zuerst)")
+
+    # CSV-Export für Alerts
     if st.session_state.alarms:
+        df_alerts = pd.DataFrame(st.session_state.alarms)
+        df_alerts["equipment_id"] = st.session_state.eq_num
+        alerts_csv = df_alerts.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Export Alerts (CSV)",
+            data=alerts_csv,
+            file_name=f"alerts_{st.session_state.eq_num}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
         for a in reversed(st.session_state.alarms[-200:]):
             if a["level"] == "ALERT":
                 st.error(f"[{a['ts']}] {a['message']}")
@@ -307,3 +332,74 @@ with tab_alerts:
                 st.warning(f"[{a['ts']}] {a['message']}")
     else:
         st.info("Keine Alarme.")
+
+# ---------------- SONSTIGES ----------------
+with tab_misc:
+    st.subheader("Beispiel: Entscheidungsbaum (IsolationForest)")
+
+    # kleines Diagramm ohne externe Libs
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.axis("off")
+
+    def add_box(ax, xy, text):
+        box = FancyBboxPatch(xy, 0.38, 0.18, boxstyle="round,pad=0.02", fc="#E6F2FF", ec="#3973AC", lw=1.5)
+        ax.add_patch(box)
+        tx = ax.text(xy[0]+0.19, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold")
+        tx.set_path_effects([patheffects.withStroke(linewidth=3, foreground="white")])
+
+    # Knoten
+    add_box(ax, (0.05, 0.65), "Temperatur < 50 °C?")
+    add_box(ax, (0.05, 0.30), "Ja → Spannung > 600 V?")
+    add_box(ax, (0.55, 0.30), "Nein → normaler Bereich")
+    add_box(ax, (0.05, 0.02), "Ja → normal")
+    add_box(ax, (0.40, 0.02), "Nein → Ausreißer")
+
+    # Pfeile
+    arrow = ArrowStyle("-|>", head_length=1.0, head_width=0.6)
+    ax.annotate("", xy=(0.24,0.39), xytext=(0.24,0.65), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
+    ax.annotate("", xy=(0.55,0.39), xytext=(0.24,0.65), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
+    ax.annotate("", xy=(0.24,0.11), xytext=(0.24,0.30), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
+    ax.annotate("", xy=(0.40,0.11), xytext=(0.24,0.30), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
+
+    st.pyplot(fig, use_container_width=True)
+    st.caption("IsolationForest nutzt viele solcher zufälligen Entscheidungsbäume. Normale Punkte brauchen mehrere Trennschritte, Ausreißer werden schnell isoliert.")
+
+    st.markdown("---")
+    st.subheader("Beispiel: Zeitreihe mit Ausreißer")
+
+    # synthetische Reihe mit Ausreißer
+    n = 80
+    x = np.arange(n)
+    y = 45 + 0.2*np.sin(x/4) + np.random.normal(0,0.2,size=n)
+    y[55] = y.mean() + 8.0  # Ausreißer
+
+    fig2, ax2 = plt.subplots(figsize=(10,3))
+    ax2.plot(x, y, linewidth=1.5)
+    ax2.scatter([55],[y[55]], s=80, color="red", zorder=5)
+    ax2.set_xlabel("Zeit (Messpunkte)")
+    ax2.set_ylabel("Temperatur (°C)")
+    ax2.set_title("Temperatur-Verlauf – markierter Ausreißer (rot)")
+    st.pyplot(fig2, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Beispiele: Excel-Exports (Vorschau)")
+
+    # Beispiel-DataFrame für Alerts (so sieht CSV aus)
+    sample_alerts = pd.DataFrame(
+        [
+            {"ts":"12:01:05","level":"WARN","message":"voltage_v hoch: 602.3","equipment_id":st.session_state.eq_num},
+            {"ts":"12:03:10","level":"ALERT","message":"ML anomaly score=0.86","equipment_id":st.session_state.eq_num},
+        ]
+    )
+    st.markdown("**Alerts-CSV (Struktur)**")
+    st.dataframe(sample_alerts, use_container_width=True, hide_index=True)
+
+    # Beispiel-DataFrame für Messdaten (so sieht CSV aus)
+    sample_ts = pd.DataFrame(
+        [
+            {"ts":"12:00:00","equipment_id":st.session_state.eq_num,"temperature_c":45.2,"vibration_rms":0.36,"current_a":121.0,"voltage_v":541.2,"fan_rpm":3180},
+            {"ts":"12:00:01","equipment_id":st.session_state.eq_num,"temperature_c":45.1,"vibration_rms":0.35,"current_a":120.8,"voltage_v":540.9,"fan_rpm":3195},
+        ]
+    )
+    st.markdown("**Messdaten-CSV (Struktur)**")
+    st.dataframe(sample_ts, use_container_width=True, hide_index=True)
