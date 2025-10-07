@@ -7,6 +7,18 @@ from sklearn.ensemble import IsolationForest
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
+# ---------------- EQUIPMENT-STAMMDATEN ----------------
+EQUIPMENTS = {
+    "10109812-01": {
+        "name": "Gleichrichter XD1",
+        "location": "Schaltschrank 1 – Galvanik Halle (Schüttgutbereich)",
+    },
+    "10109812-02": {
+        "name": "Gleichrichter XD2",
+        "location": "Schaltschrank 2 – Galvanik Halle (Schüttgutbereich)",
+    },
+}
+
 # ---------------- STATE ----------------
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(
@@ -18,6 +30,8 @@ if "running" not in st.session_state:
     st.session_state.running = False
 if "faults" not in st.session_state:
     st.session_state.faults = {"cooling": False, "fan": False, "voltage": False}
+if "eq_num" not in st.session_state:
+    st.session_state.eq_num = "10109812-01"  # Default
 
 # Default thresholds
 THRESHOLDS = {
@@ -33,7 +47,21 @@ METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 colL, colR = st.columns([1,1])
 with colL:
     st.markdown("### 🛠️ Predictive Maintenance – Gleichrichter")
-    equipment_id = st.text_input("Equipment-ID", value="RECT-0001")
+
+    # Dropdown für EQ-Nummer + automatische Anzeige der Stammdaten
+    eq_num = st.selectbox(
+        "EQ-Nummer",
+        options=list(EQUIPMENTS.keys()),
+        index=list(EQUIPMENTS.keys()).index(st.session_state.eq_num),
+        help="Wähle ein Equipment. Name & Standort werden automatisch gesetzt.",
+    )
+    st.session_state.eq_num = eq_num
+    eq_name = EQUIPMENTS[eq_num]["name"]
+    eq_loc  = EQUIPMENTS[eq_num]["location"]
+
+    st.markdown(f"**Equipment:** {eq_name}")
+    st.markdown(f"**Standort:** {eq_loc}")
+
 with colR:
     st.markdown("#### Live-Status")
     status_placeholder = st.empty()
@@ -45,7 +73,7 @@ tab_overview, tab_live, tab_alerts, tab_settings = st.tabs(["Overview", "Live Ch
 
 # ---------------- SETTINGS ----------------
 with tab_settings:
-    # --- Simulation Control (jetzt ganz oben) ---
+    # --- Simulation Control (oben) ---
     st.subheader("Simulation Control")
     cstart, cdel = st.columns([2,1])
     with cstart:
@@ -91,10 +119,9 @@ with tab_settings:
     st.markdown("---")
     st.subheader("KI-Anomalie (IsolationForest)")
 
-    # Deine kurze, feste Erklärung oben
     st.markdown(
         """
-
+**Fensterprinzip (Bewertung):**
 - Die KI betrachtet ein Fenster der letzten Messwerte (z. B. 600).
 - Jeder Messwert besteht aus Temperatur, Strom, Spannung, Vibration und Lüfter.
 - Aus den 599 vergangenen Punkten lernt sie das **normale Verhalten**.
@@ -118,7 +145,7 @@ with tab_settings:
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
     ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, 0.80, 0.05, key="ml_thresh")
 
-    # Kurz-Erklärungen direkt UNTER den Reglern (wie gewünscht)
+    # Kurz-Erklärungen unter den Reglern
     st.markdown("---")
     st.markdown("### Erläuterungen zu den Reglern")
     st.markdown("""
@@ -209,7 +236,8 @@ if st.session_state.running:
     t = len(st.session_state.df)
     vals = generate_sample(t)
     ts = datetime.now().strftime("%H:%M:%S")
-    row = {"ts": ts, "equipment_id": equipment_id, **vals}
+    # equipment_id = aktuell gewählte EQ-Nummer
+    row = {"ts": ts, "equipment_id": st.session_state.eq_num, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
     # Classical thresholds
