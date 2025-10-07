@@ -8,40 +8,46 @@ from sklearn.ensemble import IsolationForest
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
-# ---------- SAP/Fiori-ähnliches Styling (leicht, unaufdringlich) ----------
+# ---------------- DARK MODE CSS (SAP/Fiori-ähnlich) ----------------
 st.markdown("""
 <style>
 :root {
   --sap-primary: #0a6ed1;   /* SAP Fiori Blau */
-  --sap-warn:    #f0ab00;   /* SAP Warn-Gelb */
-  --sap-alert:   #bb0000;   /* Rot */
-  --sap-ok:      #107e3e;   /* Grün */
-  --sap-text:    #32363a;
+  --sap-warn:    #f0ab00;   /* Warn-Gelb */
+  --sap-alert:   #ff5c5c;   /* Rot */
+  --sap-ok:      #22c55e;   /* Grün */
+  --sap-text:    #e6eef9;   /* Helles Textgrau */
+  --sap-bg:      #0b0f14;   /* Hintergrund */
+  --sap-bg2:     #0f1520;   /* Karten/Tabs */
+  --sap-border:  #223043;
 }
-html, body, [class*="css"]  { color: var(--sap-text); }
+
+html, body, [class*="css"]  { color: var(--sap-text); background: var(--sap-bg); }
+.stApp { background: var(--sap-bg); }
+
 h1, h2, h3, h4 { color: var(--sap-primary) !important; }
-section.main > div { padding-top: 0.5rem; }
 
-.stTabs [role="tablist"] { gap: .25rem; }
-.stTabs [role="tab"] { border: 1px solid #e5e7eb; border-bottom: none; background: #f8fafc; }
-.stTabs [aria-selected="true"] { background: white; border-bottom: 2px solid var(--sap-primary); color: var(--sap-primary); }
+.stTabs [role="tablist"] { gap: .25rem; border-bottom: 1px solid var(--sap-border); }
+.stTabs [role="tab"] { border: 1px solid var(--sap-border); border-bottom: none; background: var(--sap-bg2); color: var(--sap-text); }
+.stTabs [aria-selected="true"] { background: var(--sap-bg); border-bottom: 2px solid var(--sap-primary); color: var(--sap-primary); }
 
+div[data-testid="stMetric"] {
+  border: 1px solid var(--sap-border); border-radius: 10px; padding: .5rem .75rem;
+  background: var(--sap-bg2);
+}
 div[data-testid="stMetricValue"] { color: var(--sap-primary); font-weight: 600; }
-div[data-testid="stMetric"] { border: 1px solid #eef2f7; border-radius: 10px; padding: .5rem .75rem; background: #fbfdff; }
 
-button[kind="secondary"] { border-color: var(--sap-primary) !important; color: var(--sap-primary) !important; }
 .stDownloadButton button { width: 100%; }
 
-blockquote, .legend-box {
+.legend-box {
   border-left: 4px solid var(--sap-primary);
   padding: .5rem .75rem;
-  background: #f4f9ff;
+  background: #0d1522;
   border-radius: 6px;
   margin: .25rem 0 .75rem 0;
   font-size: 0.95rem;
+  color: var(--sap-text);
 }
-.legend-inline { font-size: 0.92rem; margin-top: .25rem; }
-.legend-inline strong { color: var(--sap-primary); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -68,6 +74,7 @@ NOMINALS = {
         "fan_rpm": 3200.0,
     },
 }
+
 def defaults_from_nominals(eq_id: str):
     n = NOMINALS[eq_id]
     return {
@@ -83,14 +90,10 @@ if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(
         columns=["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
     )
-if "alarms" not in st.session_state:
-    st.session_state.alarms = []   # dicts: {"ts","level","message"}
-if "running" not in st.session_state:
-    st.session_state.running = False
-if "faults" not in st.session_state:
-    st.session_state.faults = {"cooling": False, "fan": False, "voltage": False}
-if "eq_num" not in st.session_state:
-    st.session_state.eq_num = "10109812-01"  # Default
+if "alarms" not in st.session_state: st.session_state.alarms = []   # dicts: {"ts","level","message"}
+if "running" not in st.session_state: st.session_state.running = False
+if "faults" not in st.session_state: st.session_state.faults = {"cooling": False, "fan": False, "voltage": False}
+if "eq_num" not in st.session_state: st.session_state.eq_num = "10109812-01"
 
 METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 
@@ -98,6 +101,7 @@ METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 colL, colR = st.columns([1,1])
 with colL:
     st.markdown("### 🛠️ Predictive Maintenance – Gleichrichter")
+
     eq_num = st.selectbox(
         "EQ-Nummer",
         options=list(EQUIPMENTS.keys()),
@@ -151,27 +155,27 @@ with tab_settings:
     st.subheader("Schwellwerte")
     r1, r2 = st.columns([3,3])
     with r1:
-        st.number_input("Temperatur WARN (°C)",  value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
-        st.number_input("Temperatur ALERT (°C)", value=THRESHOLDS["temperature_c"]["alert"], step=1.0, key="t_alert")
-        st.number_input("Vibration WARN (RMS)",  value=THRESHOLDS["vibration_rms"]["warn"], step=0.01, format="%.2f", key="vib_warn")
-        st.number_input("Vibration ALERT (RMS)", value=THRESHOLDS["vibration_rms"]["alert"], step=0.01, format="%.2f", key="vib_alert")
+        t_warn  = st.number_input("Temperatur WARN (°C)",  value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
+        t_alert = st.number_input("Temperatur ALERT (°C)", value=THRESHOLDS["temperature_c"]["alert"], step=1.0, key="t_alert")
+        vib_warn  = st.number_input("Vibration WARN (RMS)",  value=THRESHOLDS["vibration_rms"]["warn"], step=0.01, format="%.2f", key="vib_warn")
+        vib_alert = st.number_input("Vibration ALERT (RMS)", value=THRESHOLDS["vibration_rms"]["alert"], step=0.01, format="%.2f", key="vib_alert")
     with r2:
-        st.number_input("Strom WARN (A)",        value=THRESHOLDS["current_a"]["warn"], step=1.0, key="i_warn")
-        st.number_input("Strom ALERT (A)",       value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
-        st.number_input("Spannung WARN (V)",     value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
-        st.number_input("Spannung ALERT (V)",    value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
-        st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],   step=50.0, key="fan_warn")
-        st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"],  step=50.0, key="fan_alert")
+        i_warn  = st.number_input("Strom WARN (A)",        value=THRESHOLDS["current_a"]["warn"], step=1.0, key="i_warn")
+        i_alert = st.number_input("Strom ALERT (A)",       value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
+        u_warn  = st.number_input("Spannung WARN (V)",     value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
+        u_alert = st.number_input("Spannung ALERT (V)",    value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
+        fan_warn  = st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],  step=50.0, key="fan_warn")
+        fan_alert = st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"], step=50.0, key="fan_alert")
 
-    # >>> Legende direkt UNTER den Schwellwerten <<<
+    # ---- Legende DIREKT unter den Schwellwerten ----
     st.markdown(
         f"""
 <div class="legend-box">
 <b>SOLL &amp; Grenzwerte (für {EQUIPMENTS[st.session_state.eq_num]['name']}):</b><br/>
-- Temperatur: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['temperature_c']:.1f} °C</b> → WARN ab <b>{THRESHOLDS['temperature_c']['warn']:.1f} °C</b>, ALERT ab <b>{THRESHOLDS['temperature_c']['alert']:.1f} °C</b>.<br/>
-- Vibration: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['vibration_rms']:.2f} RMS</b> → WARN ab <b>{THRESHOLDS['vibration_rms']['warn']:.2f}</b>, ALERT ab <b>{THRESHOLDS['vibration_rms']['alert']:.2f}</b>.<br/>
-- Strom: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['current_a']:.0f} A</b> → WARN ab <b>{THRESHOLDS['current_a']['warn']:.0f} A</b>, ALERT ab <b>{THRESHOLDS['current_a']['alert']:.0f} A</b>.<br/>
-- Spannung: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['voltage_v']:.0f} V</b> → WARN ab <b>{THRESHOLDS['voltage_v']['warn']:.0f} V</b>, ALERT ab <b>{THRESHOLDS['voltage_v']['alert']:.0f} V</b>.<br/>
+- Temperatur: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['temperature_c']:.1f} °C</b> → WARN ab <b>{st.session_state.get('t_warn', THRESHOLDS['temperature_c']['warn']):.1f} °C</b>, ALERT ab <b>{st.session_state.get('t_alert', THRESHOLDS['temperature_c']['alert']):.1f} °C</b>.<br/>
+- Vibration: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['vibration_rms']:.2f} RMS</b> → WARN ab <b>{st.session_state.get('vib_warn', THRESHOLDS['vibration_rms']['warn']):.2f}</b>, ALERT ab <b>{st.session_state.get('vib_alert', THRESHOLDS['vibration_rms']['alert']):.2f}</b>.<br/>
+- Strom: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['current_a']:.0f} A</b> → WARN ab <b>{st.session_state.get('i_warn', THRESHOLDS['current_a']['warn']):.0f} A</b>, ALERT ab <b>{st.session_state.get('i_alert', THRESHOLDS['current_a']['alert']):.0f} A</b>.<br/>
+- Spannung: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['voltage_v']:.0f} V</b> → WARN ab <b>{st.session_state.get('u_warn', THRESHOLDS['voltage_v']['warn']):.0f} V</b>, ALERT ab <b>{st.session_state.get('u_alert', THRESHOLDS['voltage_v']['alert']):.0f} V</b>.<br/>
 - Lüfter (Untergrenze): <b>SOLL ~{NOMINALS[st.session_state.eq_num]['fan_rpm']:.0f} RPM</b> → WARN <b>unter {st.session_state.get('fan_warn', THRESHOLDS['fan_rpm']['warn']):.0f}</b>, ALERT <b>unter {st.session_state.get('fan_alert', THRESHOLDS['fan_rpm']['alert']):.0f}</b>.
 </div>
 """,
@@ -179,7 +183,6 @@ with tab_settings:
     )
 
     st.markdown("---")
-    # KI-Erklärung – Dein Text (unverändert)
     st.subheader("KI-Anomalie (IsolationForest)")
     st.markdown(
         """
@@ -200,6 +203,7 @@ with tab_settings:
 - **Ausreißer** werden sehr schnell isoliert → weil sie nicht ins Muster passen.
 """
     )
+
     c1, c2, c3 = st.columns(3)
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
@@ -243,6 +247,7 @@ def push_alarm(ts, level, msg):
     st.session_state.alarms.append({"ts": ts, "level": level, "message": msg})
 
 def check_thresholds(vals, ts):
+    # Nicht-Lüfter: Obergrenzen, Lüfter: Untergrenze
     for k, v in THRESHOLDS.items():
         val = float(vals[k])
         if k == "fan_rpm":
@@ -404,6 +409,7 @@ with tab_misc:
     try:
         import matplotlib.pyplot as plt
         from matplotlib.patches import FancyBboxPatch, ArrowStyle
+        plt.style.use("dark_background")  # Dark-Style für Plots
 
         # Scatter: Normal vs. Anomalie
         rng = np.random.default_rng(42)
@@ -429,9 +435,9 @@ with tab_misc:
         fig, ax = plt.subplots(figsize=(9,4))
         ax.axis("off")
         def box(xy, text):
-            b = FancyBboxPatch(xy, 0.36, 0.18, boxstyle="round,pad=0.02", fc="#E6F2FF", ec="#3973AC", lw=1.5)
+            b = FancyBboxPatch(xy, 0.36, 0.18, boxstyle="round,pad=0.02", fc="#0d2238", ec="#3973AC", lw=1.5)
             ax.add_patch(b)
-            ax.text(xy[0]+0.18, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold")
+            ax.text(xy[0]+0.18, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold", color="#e6eef9")
         box((0.05, 0.62), "Spannung > 600 V?")
         box((0.48, 0.62), "Ja → Ausreißer")
         box((0.05, 0.32), "Nein → Temp < 50 °C?")
@@ -440,12 +446,12 @@ with tab_misc:
         box((0.48, 0.02), "Ja → Ausreißer")
         box((0.78, 0.02), "Nein → Normal")
         arr = ArrowStyle("-|>", head_length=1.0, head_width=0.6)
-        ax.annotate("", xy=(0.41,0.41), xytext=(0.23,0.62), arrowprops=dict(arrowstyle=arr, lw=1.4))
-        ax.annotate("", xy=(0.48,0.70), xytext=(0.23,0.70), arrowprops=dict(arrowstyle=arr, lw=1.4))
-        ax.annotate("", xy=(0.23,0.11), xytext=(0.23,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))
-        ax.annotate("", xy=(0.66,0.41), xytext=(0.41,0.41), arrowprops=dict(arrowstyle=arr, lw=1.4))
-        ax.annotate("", xy=(0.66,0.11), xytext=(0.66,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))
-        ax.annotate("", xy=(0.83,0.11), xytext=(0.66,0.11), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.41,0.41), xytext=(0.23,0.62), arrowprops=dict(arrowstyle=arr, lw=1.4, color="#e6eef9"))
+        ax.annotate("", xy=(0.48,0.70), xytext=(0.23,0.70), arrowprops=dict(arrowstyle=arr, lw=1.4, color="#e6eef9"))
+        ax.annotate("", xy=(0.23,0.11), xytext=(0.23,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4, color="#e6eef9"))
+        ax.annotate("", xy=(0.66,0.41), xytext=(0.41,0.41), arrowprops=dict(arrowstyle=arr, lw=1.4, color="#e6eef9"))
+        ax.annotate("", xy=(0.66,0.11), xytext=(0.66,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4, color="#e6eef9"))
+        ax.annotate("", xy=(0.83,0.11), xytext=(0.66,0.11), arrowprops=dict(arrowstyle=arr, lw=1.4, color="#e6eef9"))
         st.pyplot(fig, use_container_width=True)
         st.caption("Ablauf: 1) Spannung prüfen (>600 V ⇒ Ausreißer). 2) Sonst Temperatur (<50 °C ⇒ normal). 3) Sonst Vibration prüfen (>0.8 ⇒ Ausreißer, sonst normal).")
 
