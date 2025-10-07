@@ -89,10 +89,12 @@ with tab_settings:
     st.write(
         """
         **Was macht die KI?**  
-        Sie betrachtet die letzten *N* Messpunkte (Fenstergröße) und merkt sich daraus das **normale Verhalten**.
-        Den neuesten Punkt vergleicht sie mit diesem Muster: passt er **nicht**, gilt er als **Anomalie**.
+        Sie betrachtet immer die **letzten X Messwerte** (Fenstergröße) und merkt sich daraus das **normale Verhalten**.  
+        Den neuesten Wert vergleicht sie mit diesem Muster: passt er **nicht**, gilt er als **Anomalie**.
 
-        - **Fenstergröße:** Wie viele vergangene Punkte als Referenz dienen (größer = stabiler, reagiert langsamer).  
+        - **Fenstergröße:** Anzahl der letzten Messwerte, die als Referenz dienen.  
+          → Beispiel: Fenstergröße = 600 = die letzten 600 Messwerte.  
+          → Größere Fenster = stabiler, reagiert langsamer.  
         - **Kontamination:** Erwarteter Anteil an Ausreißern im Normalbetrieb (z. B. 0.02 = 2 %).  
         - **ML-Alert-Schwelle:** Score 0..1 – ab welchem Wert die KI Alarm gibt (niedrig = empfindlich, hoch = tolerant).
 
@@ -120,11 +122,11 @@ def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
     # Faults
     if st.session_state.faults.get("cooling"):
-        base["temperature_c"] += 0.01 * t   # langsamer Drift nach oben
+        base["temperature_c"] += 0.01 * t
     if st.session_state.faults.get("fan"):
-        base["fan_rpm"] -= 0.5 * t         # langsamer Abfall der Drehzahl
+        base["fan_rpm"] -= 0.5 * t
     if st.session_state.faults.get("voltage"):
-        base["voltage_v"] += 20 * np.sin(t / 3.0)  # periodische Spike-ähnliche Schwankung
+        base["voltage_v"] += 20 * np.sin(t / 3.0)
 
     # Sensorrauschen
     base["temperature_c"] += np.random.uniform(-0.2, 0.2)
@@ -140,7 +142,7 @@ def push_alarm(ts, level, msg):
 def check_thresholds(vals, ts):
     for k, v in THRESHOLDS.items():
         val = float(vals[k])
-        if k == "fan_rpm":  # Untergrenze
+        if k == "fan_rpm":
             if val < v["alert"]:
                 push_alarm(ts, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
             elif val < v["warn"]:
@@ -152,22 +154,15 @@ def check_thresholds(vals, ts):
                 push_alarm(ts, "WARN", f"{k} hoch: {val:.1f}")
 
 def ml_anomaly(df: pd.DataFrame, window: int, contamination: float):
-    """Trainiert auf window-1 Punkten und bewertet den letzten Punkt. Gibt Score 0..1 zurück (höher = anomaler)."""
     if len(df) < window:
         return None, None
     data = df.iloc[-window:].copy()
     X = data[METRICS].astype(float).to_numpy()
-
-    # einfache Z-Standardisierung pro Feature
     mu = X.mean(axis=0); sigma = X.std(axis=0); sigma[sigma == 0] = 1e-6
     Z = (X - mu) / sigma
-
-    # auf alle bis auf den letzten Punkt trainieren, den letzten scor'en
     Z_train, z_last = Z[:-1], Z[-1].reshape(1, -1)
     model = IsolationForest(contamination=contamination, random_state=42)
     model.fit(Z_train)
-
-    # decision_function: größer = normaler; wir invertieren und normalisieren 0..1
     raw_last = -model.decision_function(z_last)[0]
     raw_train = -model.decision_function(Z_train)
     lo, hi = float(raw_train.min()), float(raw_train.max()) + 1e-9
@@ -195,12 +190,8 @@ if st.session_state.running:
     row = {"ts": ts, "equipment_id": equipment_id, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
-    # Regelbasierte Alarme
-    before = len(st.session_state.alarms)
     check_thresholds(vals, ts)
-    _ = len(st.session_state.alarms) - before  # (unused, aber könnte für KPIs genutzt werden)
 
-    # ML-basiert (Score auf letzter Probe)
     score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
     if score is not None:
         if score >= ml_alert_thresh:
@@ -226,7 +217,6 @@ with tab_overview:
         kpi4.metric("Spannung (V)", f"{latest['voltage_v']:.1f}")
         kpi5.metric("Lüfter (RPM)", f"{latest['fan_rpm']:.0f}")
 
-        # Threshold-Level für die letzte Probe
         th_levels = []
         for k, v in THRESHOLDS.items():
             val = float(latest[k])
@@ -235,7 +225,6 @@ with tab_overview:
             else:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
-        # ML-Score & Health-Badge
         score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
         lvl = overall_level(th_levels, score, ml_alert_thresh)
 
