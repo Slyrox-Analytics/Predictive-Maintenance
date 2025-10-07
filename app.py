@@ -43,22 +43,19 @@ st.markdown("---")
 # ---------------- TABS ----------------
 tab_overview, tab_live, tab_alerts, tab_settings = st.tabs(["Overview", "Live Charts", "Alerts", "Settings"])
 
-# ---------------- SETTINGS (Faults + Thresholds + ML) ----------------
+# ---------------- SETTINGS ----------------
 with tab_settings:
     st.subheader("Fault Injection (während des Laufs umschaltbar)")
-    st.caption("Schalte gezielt Störungen zu, um Warnungen/Alarme zu provozieren. Änderungen wirken sofort auf neue Messpunkte.")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt")
     with c2:
         st.session_state.faults["fan"] = st.checkbox("Fan Wear — Lüfter RPM sinkt")
     with c3:
-        st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungs-Ausreißer")
+        st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen")
 
     st.markdown("---")
     st.subheader("Schwellwerte")
-
-    # Zwei Spalten für klare Labels + Einheiten
     r1, r2 = st.columns([3,3])
     with r1:
         t_warn  = st.number_input("Temperatur WARN (°C)", value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
@@ -71,13 +68,12 @@ with tab_settings:
         u_warn  = st.number_input("Spannung WARN (V)", value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
         u_alert = st.number_input("Spannung ALERT (V)", value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
 
-    # RPM Untergrenzen separat
     st.markdown("---")
     st.subheader("Lüfter (RPM) – Untergrenzen")
     rpm_warn  = st.number_input("RPM WARN (unter)", value=THRESHOLDS["fan_rpm"]["warn"], step=10.0, key="rpm_warn")
     rpm_alert = st.number_input("RPM ALERT (unter)", value=THRESHOLDS["fan_rpm"]["alert"], step=10.0, key="rpm_alert")
 
-    # Übernahme in die globalen Thresholds
+    # Update Thresholds
     THRESHOLDS["temperature_c"]["warn"], THRESHOLDS["temperature_c"]["alert"] = float(t_warn), float(t_alert)
     THRESHOLDS["vibration_rms"]["warn"], THRESHOLDS["vibration_rms"]["alert"] = float(vib_warn), float(vib_alert)
     THRESHOLDS["current_a"]["warn"],     THRESHOLDS["current_a"]["alert"]     = float(i_warn),  float(i_alert)
@@ -94,7 +90,6 @@ with tab_settings:
 
         - **Fenstergröße:** Anzahl der letzten Messwerte, die als Referenz dienen.  
           → Beispiel: Fenstergröße = 600 = die letzten 600 Messwerte.  
-          → Größere Fenster = stabiler, reagiert langsamer.  
         - **Kontamination:** Erwarteter Anteil an Ausreißern im Normalbetrieb (z. B. 0.02 = 2 %).  
         - **ML-Alert-Schwelle:** Score 0..1 – ab welchem Wert die KI Alarm gibt (niedrig = empfindlich, hoch = tolerant).
 
@@ -102,6 +97,25 @@ with tab_settings:
         Wenn ein neuer Wert nicht ins Muster passt, meldet sie eine Anomalie – auch ohne feste Grenzwertverletzung.
         """
     )
+
+    # 👉 Dein gewünschter Zusatzblock (Schritt für Schritt)
+    st.markdown("### 🧠 IsolationForest – Schritt für Schritt")
+    st.markdown("""
+    1. **Sie nimmt die letzten X Messpunkte** (Fenstergröße, z. B. 600).  
+       → Jeder Messpunkt hat **Temperatur, Strom, Spannung, Vibration, Lüfter**.
+
+    2. **Sie baut aus diesen Punkten ein Modell:**  
+       → Viele **Entscheidungsbäume („Forest“)** teilen die Punkte in Gruppen auf.
+
+    3. **Sie bewertet den neuesten Punkt (den letzten deiner Zeitreihe):**  
+       → **Passt** er ins Muster der 599 davor → **normal**.  
+       → **Lässt** er sich extrem schnell **isolieren** → **ungewöhnlich = Anomalie**.
+
+    4. **Was macht sie dann damit?**  
+       → Sie gibt einen **Anomalie-Score** *(0 = normal, 1 = sehr ungewöhnlich).*  
+       → **Liegt der Score über deiner eingestellten Schwelle**, erzeugt die App **automatisch eine Alarmmeldung** (Tab **Alerts**) und die **Health-Badge** geht auf **WARN/ALERT**.
+    """)
+
     c1, c2, c3 = st.columns(3)
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
@@ -120,15 +134,12 @@ with tab_settings:
 # ---------------- SIMULATOR ----------------
 def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
-    # Faults
     if st.session_state.faults.get("cooling"):
         base["temperature_c"] += 0.01 * t
     if st.session_state.faults.get("fan"):
         base["fan_rpm"] -= 0.5 * t
     if st.session_state.faults.get("voltage"):
         base["voltage_v"] += 20 * np.sin(t / 3.0)
-
-    # Sensorrauschen
     base["temperature_c"] += np.random.uniform(-0.2, 0.2)
     base["vibration_rms"] += np.random.uniform(-0.02, 0.02)
     base["current_a"]     += np.random.uniform(-2, 2)
@@ -191,7 +202,6 @@ if st.session_state.running:
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
     check_thresholds(vals, ts)
-
     score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
     if score is not None:
         if score >= ml_alert_thresh:
