@@ -25,7 +25,7 @@ if "df" not in st.session_state:
         columns=["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
     )
 if "alarms" not in st.session_state:
-    st.session_state.alarms = []  # dicts: {"ts","level","message"} (+ wir fügen bei Export equipment_id an)
+    st.session_state.alarms = []
 if "running" not in st.session_state:
     st.session_state.running = False
 if "faults" not in st.session_state:
@@ -69,9 +69,7 @@ with colR:
 st.markdown("---")
 
 # ---------------- TABS ----------------
-tab_overview, tab_live, tab_alerts, tab_settings, tab_misc = st.tabs(
-    ["Overview", "Live Charts", "Alerts", "Settings", "Sonstiges"]
-)
+tab_overview, tab_live, tab_alerts, tab_settings = st.tabs(["Overview", "Live Charts", "Alerts", "Settings"])
 
 # ---------------- SETTINGS ----------------
 with tab_settings:
@@ -118,14 +116,6 @@ with tab_settings:
         u_warn  = st.number_input("Spannung WARN (V)", value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
         u_alert = st.number_input("Spannung ALERT (V)", value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
 
-    # ➕ Fan-RPM Schwellen (fehlten vorher)
-    fr_warn, fr_alert = st.columns(2)
-    with fr_warn:
-        fan_warn = st.number_input("Lüfter WARN (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["warn"], step=50.0, key="fan_warn")
-    with fr_alert:
-        fan_alert = st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"], step=50.0, key="fan_alert")
-    # (optional: in THRESHOLDS übernehmen – hier nur Anzeige/Regelung)
-
     st.markdown("---")
     st.subheader("KI-Anomalie (IsolationForest)")
 
@@ -155,7 +145,7 @@ with tab_settings:
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
     ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, 0.80, 0.05, key="ml_thresh")
 
-    # Kurz-Erklärungen unter den Reglern (so wie du sie wolltest)
+    # Kurz-Erklärungen unter den Reglern
     st.markdown("---")
     st.markdown("### Erläuterungen zu den Reglern")
     st.markdown("""
@@ -202,12 +192,9 @@ def check_thresholds(vals, ts):
     for k, v in THRESHOLDS.items():
         val = float(vals[k])
         if k == "fan_rpm":
-            # Untergrenzen-Logik
-            warn_thr = st.session_state.get("fan_warn", THRESHOLDS["fan_rpm"]["warn"])
-            alert_thr = st.session_state.get("fan_alert", THRESHOLDS["fan_rpm"]["alert"])
-            if val < alert_thr:
+            if val < v["alert"]:
                 push_alarm(ts, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
-            elif val < warn_thr:
+            elif val < v["warn"]:
                 push_alarm(ts, "WARN", f"{k} niedrig: {val:.1f} RPM")
         else:
             if val > v["alert"]:
@@ -248,7 +235,8 @@ def overall_level(th_levels, ml_score, ml_thresh):
 if st.session_state.running:
     t = len(st.session_state.df)
     vals = generate_sample(t)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Datum + Zeit
+    ts = datetime.now().strftime("%H:%M:%S")
+    # equipment_id = aktuell gewählte EQ-Nummer
     row = {"ts": ts, "equipment_id": st.session_state.eq_num, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
@@ -272,31 +260,6 @@ else:
 # ---------------- OVERVIEW ----------------
 with tab_overview:
     st.subheader("Gesamtzustand")
-    # Export-Buttons gut sichtbar rechts
-    exp_l, exp_r = st.columns([3,2])
-    with exp_r:
-        data_csv = st.session_state.df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Export Messdaten (CSV)",
-            data=data_csv,
-            file_name=f"timeseries_{st.session_state.eq_num}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        # Alerts-Export auch hier (zusätzlich zu Alerts-Tab)
-        df_alerts_over = pd.DataFrame(st.session_state.alarms)
-        if not df_alerts_over.empty:
-            df_alerts_over["equipment_id"] = st.session_state.eq_num
-        else:
-            df_alerts_over = pd.DataFrame(columns=["ts","level","message","equipment_id"])
-        st.download_button(
-            "⬇️ Export Alerts (CSV)",
-            data=df_alerts_over.to_csv(index=False).encode("utf-8"),
-            file_name=f"alerts_{st.session_state.eq_num}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
     if len(st.session_state.df):
         latest = st.session_state.df.iloc[-1]
         kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
@@ -310,10 +273,7 @@ with tab_overview:
         for k, v in THRESHOLDS.items():
             val = float(latest[k])
             if k == "fan_rpm":
-                # nutze ggf. die UI-Werte
-                warn_thr = st.session_state.get("fan_warn", THRESHOLDS["fan_rpm"]["warn"])
-                alert_thr = st.session_state.get("fan_alert", THRESHOLDS["fan_rpm"]["alert"])
-                th_levels.append("ALERT" if val < alert_thr else "WARN" if val < warn_thr else "OK")
+                th_levels.append("ALERT" if val < v["alert"] else "WARN" if val < v["warn"] else "OK")
             else:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
@@ -339,21 +299,6 @@ with tab_live:
 # ---------------- ALERTS ----------------
 with tab_alerts:
     st.subheader("Alarm-Feed (neueste zuerst)")
-
-    # CSV-Export für Alerts
-    df_alerts = pd.DataFrame(st.session_state.alarms)
-    if not df_alerts.empty:
-        df_alerts["equipment_id"] = st.session_state.eq_num
-    else:
-        df_alerts = pd.DataFrame(columns=["ts","level","message","equipment_id"])
-    st.download_button(
-        "⬇️ Export Alerts (CSV)",
-        data=df_alerts.to_csv(index=False).encode("utf-8"),
-        file_name=f"alerts_{st.session_state.eq_num}.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-
     if st.session_state.alarms:
         for a in reversed(st.session_state.alarms[-200:]):
             if a["level"] == "ALERT":
@@ -362,61 +307,3 @@ with tab_alerts:
                 st.warning(f"[{a['ts']}] {a['message']}")
     else:
         st.info("Keine Alarme.")
-
-# ---------------- SONSTIGES ----------------
-with tab_misc:
-    st.subheader("IsolationForest – Normal vs. Anomalie (Illustration)")
-    # Nur das richtige Bild (Scatter), kein Baum, keine Zeitreihe
-    try:
-        import matplotlib.pyplot as plt
-        rng = np.random.default_rng(42)
-        n = 150
-        temp_norm = 50 + rng.normal(0, 2.0, n)
-        curr_norm = 120 + rng.normal(0, 3.0, n)
-        anom_temp = 65.0
-        anom_curr = 120.0
-
-        fig_sc, ax_sc = plt.subplots(figsize=(8,5))
-        ax_sc.scatter(temp_norm, curr_norm, s=25, label="Normal")
-        ax_sc.scatter([anom_temp],[anom_curr], s=60, marker="x", linewidths=2.5, label="Anomalie")
-        ax_sc.annotate("Anomalie", xy=(anom_temp, anom_curr),
-                       xytext=(anom_temp-7, anom_curr+8),
-                       arrowprops=dict(arrowstyle="->", lw=1.5))
-        ax_sc.set_xlabel("Temperatur (°C)")
-        ax_sc.set_ylabel("Strom (A)")
-        ax_sc.legend()
-        st.pyplot(fig_sc, use_container_width=True)
-    except Exception:
-        st.warning("Matplotlib fehlt – bitte `matplotlib` in requirements.txt eintragen.")
-
-    st.markdown("---")
-    st.subheader("Beispiel: Export (eine Liste – Vorschau)")
-
-    # Eine einzige Liste als Vorschau: Alerts + Messkontext an der gleichen Zeit (nur echte Felder)
-    if len(st.session_state.df) or len(st.session_state.alarms):
-        df_ts_ctx = st.session_state.df.copy()
-        df_alerts_ctx = pd.DataFrame(st.session_state.alarms)
-        if not df_alerts_ctx.empty:
-            df_alerts_ctx["equipment_id"] = st.session_state.eq_num
-            # Kontext-Messwerte an gleicher ts anhängen (nur vorhandene Felder)
-            df_alerts_ctx = df_alerts_ctx.merge(
-                df_ts_ctx[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
-                on=["ts","equipment_id"],
-                how="left"
-            )
-            preview = df_alerts_ctx[["ts","equipment_id","level","message","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]].copy()
-            st.dataframe(preview.tail(10), use_container_width=True, hide_index=True)
-        else:
-            st.info("Noch keine Alarme – Vorschau wird angezeigt, sobald Alarme vorliegen.")
-    else:
-        # Minimale sinnvolle Demo-Zeilen (nur Felder, die es wirklich gibt)
-        demo_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        demo = pd.DataFrame(
-            [
-                {"ts": demo_ts, "equipment_id": st.session_state.eq_num, "level": "WARN",  "message": "voltage_v hoch: 602.3",
-                 "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 602.3, "fan_rpm": 3180},
-                {"ts": demo_ts, "equipment_id": st.session_state.eq_num, "level": "ALERT", "message": "ML anomaly score=0.86",
-                 "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 541.2, "fan_rpm": 3180},
-            ]
-        )
-        st.dataframe(demo, use_container_width=True, hide_index=True)
