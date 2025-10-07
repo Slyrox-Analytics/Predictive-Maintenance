@@ -134,7 +134,7 @@ with tab_settings:
 • Groß = toleranter (meldet nur stärkere Abweichungen).  
 
 **ML-Alert-Schwelle (0–1)**  
-➡️ Ab welchem Anomalie-Score die KI Alarm gibt.  
+➡️ Ab welchem Anomalie-Score das Machine-Learning-Modell (IsolationForest) Alarm gibt.  
 • Score nahe 0 = Punkt ist normal.  
 • Score nahe 1 = Punkt ist sehr ungewöhnlich.  
 • Liegt der Score über dieser Schwelle (z. B. 0.8), wird ein Alarm im Dashboard ausgelöst.
