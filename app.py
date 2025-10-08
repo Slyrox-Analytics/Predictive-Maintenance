@@ -1,24 +1,83 @@
 import time
+import io
 import pandas as pd
 import numpy as np
 import streamlit as st
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
-from streamlit import rerun  # << NEU: statt st.experimental_rerun()
+from streamlit import rerun  # <<< NEU: statt st.experimental_rerun()
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
+# ---------- SAP/Fiori-ähnliches Styling (leicht, unaufdringlich) ----------
+st.markdown("""
+<style>
+:root {
+  --sap-primary: #0a6ed1;   /* SAP Fiori Blau */
+  --sap-warn:    #f0ab00;   /* SAP Warn-Gelb */
+  --sap-alert:   #bb0000;   /* Rot */
+  --sap-ok:      #107e3e;   /* Grün */
+  --sap-text:    #32363a;
+}
+html, body, [class*="css"]  { color: var(--sap-text); }
+h1, h2, h3, h4 { color: var(--sap-primary) !important; }
+section.main > div { padding-top: 0.5rem; }
+
+.stTabs [role="tablist"] { gap: .25rem; }
+.stTabs [role="tab"] { border: 1px solid #e5e7eb; border-bottom: none; background: #f8fafc; }
+.stTabs [aria-selected="true"] { background: white; border-bottom: 2px solid var(--sap-primary); color: var(--sap-primary); }
+
+div[data-testid="stMetricValue"] { color: var(--sap-primary); font-weight: 600; }
+div[data-testid="stMetric"] { border: 1px solid #eef2f7; border-radius: 10px; padding: .5rem .75rem; background: #fbfdff; }
+
+button[kind="secondary"] { border-color: var(--sap-primary) !important; color: var(--sap-primary) !important; }
+.stDownloadButton button { width: 100%; }
+
+blockquote, .legend-box {
+  border-left: 4px solid var(--sap-primary);
+  padding: .5rem .75rem;
+  background: #f4f9ff;
+  border-radius: 6px;
+  margin: .25rem 0 .75rem 0;
+  font-size: 0.95rem;
+}
+.legend-inline { font-size: 0.92rem; margin-top: .25rem; }
+.legend-inline strong { color: var(--sap-primary); }
+</style>
+""", unsafe_allow_html=True)
+
 # ---------------- EQUIPMENT-STAMMDATEN ----------------
 EQUIPMENTS = {
-    "10109812-01": {
-        "name": "Gleichrichter XD1",
-        "location": "Schaltschrank 1 – Galvanik Halle (Schüttgutbereich)",
+    "10109812-01": {"name": "Gleichrichter XD1", "location": "Schaltschrank 1 – Galvanik Halle (Schüttgutbereich)"},
+    "10109812-02": {"name": "Gleichrichter XD2", "location": "Schaltschrank 2 – Galvanik Halle (Schüttgutbereich)"},
+}
+
+# ---------------- SOLLWERTE (Nominals) ----------------
+NOMINALS = {
+    "10109812-01": {  # XD1
+        "temperature_c": 45.0,
+        "vibration_rms": 0.35,
+        "current_a": 120.0,
+        "voltage_v": 540.0,
+        "fan_rpm": 3200.0,
     },
-    "10109812-02": {
-        "name": "Gleichrichter XD2",
-        "location": "Schaltschrank 2 – Galvanik Halle (Schüttgutbereich)",
+    "10109812-02": {  # XD2 (identisch; bei Bedarf später separat anpassen)
+        "temperature_c": 45.0,
+        "vibration_rms": 0.35,
+        "current_a": 120.0,
+        "voltage_v": 540.0,
+        "fan_rpm": 3200.0,
     },
 }
+def defaults_from_nominals(eq_id: str):
+    n = NOMINALS[eq_id]
+    return {
+        "temperature_c": {"warn": n["temperature_c"] + 15.0,  "alert": n["temperature_c"] + 25.0},
+        "vibration_rms": {"warn": n["vibration_rms"] + 0.25,  "alert": n["vibration_rms"] + 0.45},
+        "current_a":     {"warn": n["current_a"] * 1.25,      "alert": n["current_a"] * 1.50},
+        "voltage_v":     {"warn": n["voltage_v"] * 1.07,      "alert": n["voltage_v"] * 1.15},
+        "fan_rpm":       {"warn": n["fan_rpm"] - 600.0,       "alert": n["fan_rpm"] - 1200.0},  # Untergrenze
+    }
 
 # ---------------- STATE ----------------
 if "df" not in st.session_state:
@@ -26,7 +85,7 @@ if "df" not in st.session_state:
         columns=["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
     )
 if "alarms" not in st.session_state:
-    st.session_state.alarms = []
+    st.session_state.alarms = []   # dicts: {"ts","level","message"}
 if "running" not in st.session_state:
     st.session_state.running = False
 if "faults" not in st.session_state:
@@ -34,22 +93,12 @@ if "faults" not in st.session_state:
 if "eq_num" not in st.session_state:
     st.session_state.eq_num = "10109812-01"  # Default
 
-# Default thresholds
-THRESHOLDS = {
-    "temperature_c": {"warn": 60.0,  "alert": 70.0},   # °C
-    "vibration_rms": {"warn": 0.60,  "alert": 0.80},   # RMS
-    "current_a":     {"warn": 150.0, "alert": 180.0},  # A
-    "voltage_v":     {"warn": 580.0, "alert": 620.0},  # V
-    "fan_rpm":       {"warn": 2600.0,"alert": 2000.0}, # RPM (Untergrenze)
-}
 METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 
 # ---------------- HEADER ----------------
 colL, colR = st.columns([1,1])
 with colL:
     st.markdown("### 🛠️ Predictive Maintenance – Gleichrichter")
-
-    # Dropdown für EQ-Nummer + automatische Anzeige der Stammdaten
     eq_num = st.selectbox(
         "EQ-Nummer",
         options=list(EQUIPMENTS.keys()),
@@ -57,17 +106,16 @@ with colL:
         help="Wähle ein Equipment. Name & Standort werden automatisch gesetzt.",
     )
     st.session_state.eq_num = eq_num
-    eq_name = EQUIPMENTS[eq_num]["name"]
-    eq_loc  = EQUIPMENTS[eq_num]["location"]
-
-    st.markdown(f"**Equipment:** {eq_name}")
-    st.markdown(f"**Standort:** {eq_loc}")
-
+    st.markdown(f"**Equipment:** {EQUIPMENTS[eq_num]['name']}")
+    st.markdown(f"**Standort:** {EQUIPMENTS[eq_num]['location']}")
 with colR:
     st.markdown("#### Live-Status")
     status_placeholder = st.empty()
 
 st.markdown("---")
+
+# --- abgeleitete, aktuelle Grenzwerte aus SOLL des ausgewählten Geräts
+THRESHOLDS = defaults_from_nominals(st.session_state.eq_num)
 
 # ---------------- TABS ----------------
 tab_overview, tab_live, tab_alerts, tab_settings, tab_misc = st.tabs(
@@ -76,14 +124,13 @@ tab_overview, tab_live, tab_alerts, tab_settings, tab_misc = st.tabs(
 
 # ---------------- SETTINGS ----------------
 with tab_settings:
-    # --- Simulation Control (oben) ---
     st.subheader("Simulation Control")
     cstart, cdel = st.columns([2,1])
     with cstart:
         if not st.session_state.running:
             if st.button("▶️ Start Simulation", use_container_width=True):
                 st.session_state.running = True
-                rerun()  # << vorher: st.experimental_rerun()
+                rerun()  # <<< vorher st.experimental_rerun()
         else:
             if st.button("⏹ Stop Simulation", use_container_width=True):
                 st.session_state.running = False
@@ -95,33 +142,46 @@ with tab_settings:
 
     st.markdown("---")
 
-    # Fault Injection
     st.subheader("Fault Injection (während des Laufs umschaltbar)")
     c1, c2, c3 = st.columns(3)
-    with c1:
-        st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt")
-    with c2:
-        st.session_state.faults["fan"] = st.checkbox("Fan Wear — Lüfter RPM sinkt")
-    with c3:
-        st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen")
+    with c1: st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt")
+    with c2: st.session_state.faults["fan"]     = st.checkbox("Fan Wear — Lüfter RPM sinkt")
+    with c3: st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen")
 
     st.markdown("---")
     st.subheader("Schwellwerte")
     r1, r2 = st.columns([3,3])
     with r1:
-        t_warn  = st.number_input("Temperatur WARN (°C)", value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
-        t_alert = st.number_input("Temperatur ALERT (°C)", value=THRESHOLDS["temperature_c"]["alert"], step=1.0, key="t_alert")
-        vib_warn  = st.number_input("Vibration WARN (RMS)", value=THRESHOLDS["vibration_rms"]["warn"], step=0.01, format="%.2f", key="vib_warn")
-        vib_alert = st.number_input("Vibration ALERT (RMS)", value=THRESHOLDS["vibration_rms"]["alert"], step=0.01, format="%.2f", key="vib_alert")
+        st.number_input("Temperatur WARN (°C)",  value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
+        st.number_input("Temperatur ALERT (°C)", value=THRESHOLDS["temperature_c"]["alert"], step=1.0, key="t_alert")
+        st.number_input("Vibration WARN (RMS)",  value=THRESHOLDS["vibration_rms"]["warn"], step=0.01, format="%.2f", key="vib_warn")
+        st.number_input("Vibration ALERT (RMS)", value=THRESHOLDS["vibration_rms"]["alert"], step=0.01, format="%.2f", key="vib_alert")
     with r2:
-        i_warn  = st.number_input("Strom WARN (A)", value=THRESHOLDS["current_a"]["warn"], step=1.0, key="i_warn")
-        i_alert = st.number_input("Strom ALERT (A)", value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
-        u_warn  = st.number_input("Spannung WARN (V)", value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
-        u_alert = st.number_input("Spannung ALERT (V)", value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
+        st.number_input("Strom WARN (A)",        value=THRESHOLDS["current_a"]["warn"], step=1.0, key="i_warn")
+        st.number_input("Strom ALERT (A)",       value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
+        st.number_input("Spannung WARN (V)",     value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
+        st.number_input("Spannung ALERT (V)",    value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
+        st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],   step=50.0, key="fan_warn")
+        st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"],  step=50.0, key="fan_alert")
+
+    # >>> Legende direkt UNTER den Schwellwerten <<<
+    st.markdown(
+        f"""
+<div class="legend-box">
+<b>SOLL &amp; Grenzwerte (für {EQUIPMENTS[st.session_state.eq_num]['name']}):</b><br/>
+- Temperatur: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['temperature_c']:.1f} °C</b> → WARN ab <b>{THRESHOLDS['temperature_c']['warn']:.1f} °C</b>, ALERT ab <b>{THRESHOLDS['temperature_c']['alert']:.1f} °C</b>.<br/>
+- Vibration: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['vibration_rms']:.2f} RMS</b> → WARN ab <b>{THRESHOLDS['vibration_rms']['warn']:.2f}</b>, ALERT ab <b>{THRESHOLDS['vibration_rms']['alert']:.2f}</b>.<br/>
+- Strom: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['current_a']:.0f} A</b> → WARN ab <b>{THRESHOLDS['current_a']['warn']:.0f} A</b>, ALERT ab <b>{THRESHOLDS['current_a']['alert']:.0f} A</b>.<br/>
+- Spannung: <b>SOLL ~{NOMINALS[st.session_state.eq_num]['voltage_v']:.0f} V</b> → WARN ab <b>{THRESHOLDS['voltage_v']['warn']:.0f} V</b>, ALERT ab <b>{THRESHOLDS['voltage_v']['alert']:.0f} V</b>.<br/>
+- Lüfter (Untergrenze): <b>SOLL ~{NOMINALS[st.session_state.eq_num]['fan_rpm']:.0f} RPM</b> → WARN <b>unter {st.session_state.get('fan_warn', THRESHOLDS['fan_rpm']['warn']):.0f}</b>, ALERT <b>unter {st.session_state.get('fan_alert', THRESHOLDS['fan_rpm']['alert']):.0f}</b>.
+</div>
+""",
+        unsafe_allow_html=True
+    )
 
     st.markdown("---")
+    # KI-Erklärung – Dein Text (unverändert)
     st.subheader("KI-Anomalie (IsolationForest)")
-
     st.markdown(
         """
 **Fensterprinzip (Bewertung):**
@@ -141,14 +201,11 @@ with tab_settings:
 - **Ausreißer** werden sehr schnell isoliert → weil sie nicht ins Muster passen.
 """
     )
-
-    # Regler
     c1, c2, c3 = st.columns(3)
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
     ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, 0.80, 0.05, key="ml_thresh")
 
-    # Kurz-Erklärungen unter den Reglern
     st.markdown("---")
     st.markdown("### Erläuterungen zu den Reglern")
     st.markdown("""
@@ -170,17 +227,12 @@ with tab_settings:
 • Liegt der Score über dieser Schwelle (z. B. 0.8), wird ein Alarm im Dashboard ausgelöst.
 """)
 
-# ---------------- SIMULATOR ----------------
+# ---------------- FUNKTIONEN ----------------
 def generate_sample(t: int):
     base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
-    # Faults
-    if st.session_state.faults.get("cooling"):
-        base["temperature_c"] += 0.01 * t
-    if st.session_state.faults.get("fan"):
-        base["fan_rpm"] -= 0.5 * t
-    if st.session_state.faults.get("voltage"):
-        base["voltage_v"] += 20 * np.sin(t / 3.0)
-    # Noise
+    if st.session_state.faults.get("cooling"): base["temperature_c"] += 0.01 * t
+    if st.session_state.faults.get("fan"):     base["fan_rpm"] -= 0.5 * t
+    if st.session_state.faults.get("voltage"): base["voltage_v"] += 20 * np.sin(t / 3.0)
     base["temperature_c"] += np.random.uniform(-0.2, 0.2)
     base["vibration_rms"] += np.random.uniform(-0.02, 0.02)
     base["current_a"]     += np.random.uniform(-2, 2)
@@ -195,19 +247,16 @@ def check_thresholds(vals, ts):
     for k, v in THRESHOLDS.items():
         val = float(vals[k])
         if k == "fan_rpm":
-            if val < v["alert"]:
-                push_alarm(ts, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
-            elif val < v["warn"]:
-                push_alarm(ts, "WARN", f"{k} niedrig: {val:.1f} RPM")
+            warn_thr  = st.session_state.get("fan_warn", THRESHOLDS["fan_rpm"]["warn"])
+            alert_thr = st.session_state.get("fan_alert", THRESHOLDS["fan_rpm"]["alert"])
+            if val < alert_thr: push_alarm(ts, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
+            elif val < warn_thr: push_alarm(ts, "WARN", f"{k} niedrig: {val:.1f} RPM")
         else:
-            if val > v["alert"]:
-                push_alarm(ts, "ALERT", f"{k} zu hoch: {val:.1f}")
-            elif val > v["warn"]:
-                push_alarm(ts, "WARN", f"{k} hoch: {val:.1f}")
+            if val > v["alert"]: push_alarm(ts, "ALERT", f"{k} zu hoch: {val:.1f}")
+            elif val > v["warn"]: push_alarm(ts, "WARN", f"{k} hoch: {val:.1f}")
 
 def ml_anomaly(df: pd.DataFrame, window: int, contamination: float):
-    if len(df) < window:
-        return None, None
+    if len(df) < window: return None, None
     data = df.iloc[-window:].copy()
     X = data[METRICS].astype(float).to_numpy()
     mu = X.mean(axis=0); sigma = X.std(axis=0); sigma[sigma == 0] = 1e-6
@@ -215,7 +264,7 @@ def ml_anomaly(df: pd.DataFrame, window: int, contamination: float):
     Z_train, z_last = Z[:-1], Z[-1].reshape(1, -1)
     model = IsolationForest(contamination=contamination, random_state=42)
     model.fit(Z_train)
-    raw_last = -model.decision_function(z_last)[0]
+    raw_last  = -model.decision_function(z_last)[0]
     raw_train = -model.decision_function(Z_train)
     lo, hi = float(raw_train.min()), float(raw_train.max()) + 1e-9
     score = (raw_last - lo) / (hi - lo)
@@ -225,85 +274,117 @@ def overall_level(th_levels, ml_score, ml_thresh):
     order = {"OK": 0, "WARN": 1, "ALERT": 2}
     level = "OK"
     for lv in th_levels:
-        if order[lv] > order[level]:
-            level = lv
+        if order[lv] > order[level]: level = lv
     if ml_score is not None:
-        if ml_score >= ml_thresh:
-            level = "ALERT"
-        elif ml_score >= (ml_thresh * 0.7) and order["WARN"] > order[level]:
-            level = "WARN"
+        if ml_score >= ml_thresh: level = "ALERT"
+        elif ml_score >= (ml_thresh * 0.7) and order["WARN"] > order[level]: level = "WARN"
     return level
+
+def build_analysis_df():
+    """Eine Liste: jeder Alarm + Mess-Kontext am selben ts."""
+    if not st.session_state.alarms:
+        return pd.DataFrame(columns=[
+            "ts","equipment_id","level","message",
+            "temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"
+        ])
+    df_alerts = pd.DataFrame(st.session_state.alarms).copy()
+    df_alerts["equipment_id"] = st.session_state.eq_num
+    df_ts = st.session_state.df.copy()
+    merged = df_alerts.merge(
+        df_ts[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
+        on=["ts","equipment_id"], how="left"
+    )
+    cols = ["ts","equipment_id","level","message","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
+    return merged.reindex(columns=cols)
 
 # ---------------- LIVE LOOP ----------------
 if st.session_state.running:
     t = len(st.session_state.df)
     vals = generate_sample(t)
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = {"ts": ts, "equipment_id": st.session_state.eq_num, **vals}
     st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
 
-    # Classical thresholds
     check_thresholds(vals, ts)
 
-    # ML anomaly
     score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
     if score is not None:
-        if score >= ml_alert_thresh:
-            push_alarm(ts, "ALERT", f"ML anomaly score={score:.2f}")
-        elif score >= ml_alert_thresh * 0.7:
-            push_alarm(ts, "WARN", f"ML anomaly score={score:.2f}")
+        if score >= ml_alert_thresh: push_alarm(ts, "ALERT", f"ML anomaly score={score:.2f}")
+        elif score >= ml_alert_thresh * 0.7: push_alarm(ts, "WARN", f"ML anomaly score={score:.2f}")
 
     status_placeholder.success(f"RUNNING – Last sample @ {ts}")
     time.sleep(1)
-    rerun()  # << vorher: st.experimental_rerun()
+    rerun()  # <<< vorher st.experimental_rerun()
 else:
     status_placeholder.warning("Simulation gestoppt")
 
 # ---------------- OVERVIEW ----------------
 with tab_overview:
     st.subheader("Gesamtzustand")
+
+    # Export rechts oben: eine Liste (CSV + Excel)
+    exp_l, exp_r = st.columns([3,2])
+    with exp_r:
+        analysis_df = build_analysis_df()
+        st.download_button(
+            "⬇️ Export Analyse (CSV)",
+            data=analysis_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"analysis_{st.session_state.eq_num}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_analysis_csv_overview",
+        )
+        try:
+            import openpyxl  # noqa: F401
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+                analysis_df.to_excel(xw, index=False, sheet_name="analysis")
+            st.download_button(
+                "⬇️ Export Analyse (Excel)",
+                data=buf.getvalue(),
+                file_name=f"analysis_{st.session_state.eq_num}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_analysis_xlsx_overview",
+            )
+        except Exception:
+            st.info("Für Excel-Export `openpyxl` in requirements.txt ergänzen (z. B. openpyxl==3.1.5).")
+
     if len(st.session_state.df):
         latest = st.session_state.df.iloc[-1]
-        kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-        kpi1.metric("Temperatur (°C)", f"{latest['temperature_c']:.1f}")
-        kpi2.metric("Vibration (RMS)", f"{latest['vibration_rms']:.2f}")
-        kpi3.metric("Strom (A)", f"{latest['current_a']:.1f}")
-        kpi4.metric("Spannung (V)", f"{latest['voltage_v']:.1f}")
-        kpi5.metric("Lüfter (RPM)", f"{latest['fan_rpm']:.0f}")
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Temperatur (°C)", f"{latest['temperature_c']:.1f}")
+        k2.metric("Vibration (RMS)", f"{latest['vibration_rms']:.2f}")
+        k3.metric("Strom (A)", f"{latest['current_a']:.1f}")
+        k4.metric("Spannung (V)", f"{latest['voltage_v']:.1f}")
+        k5.metric("Lüfter (RPM)", f"{latest['fan_rpm']:.0f}")
 
+        # Schwellen je Merkmal checken (mit Lüfter-Untergrenze)
         th_levels = []
-        for k, v in THRESHOLDS.items():
+        for k, v in defaults_from_nominals(st.session_state.eq_num).items():
             val = float(latest[k])
             if k == "fan_rpm":
-                th_levels.append("ALERT" if val < v["alert"] else "WARN" if val < v["warn"] else "OK")
+                warn_thr  = st.session_state.get("fan_warn", v["warn"])
+                alert_thr = st.session_state.get("fan_alert", v["alert"])
+                th_levels.append("ALERT" if val < alert_thr else "WARN" if val < warn_thr else "OK")
             else:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
         score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
         lvl = overall_level(th_levels, score, ml_alert_thresh)
 
-        colA, colB = st.columns([1, 3])
-        with colA:
+        cA, cB = st.columns([1,3])
+        with cA:
             badge = {"OK": "✅ OK", "WARN": "🟠 WARN", "ALERT": "🔴 ALERT"}[lvl]
             st.markdown(f"**Health:** {badge}")
-        with colB:
+        with cB:
             st.caption(f"ML-Score: {score:.2f}" if score is not None else "ML-Score: – (zu wenig Daten)")
-
-        # CSV-Export für Messdaten
-        data_csv = st.session_state.df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Export Messdaten (CSV)",
-            data=data_csv,
-            file_name=f"timeseries_{st.session_state.eq_num}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="dl_timeseries_overview",
-        )
     else:
         st.info("Noch keine Daten.")
 
 # ---------------- LIVE CHARTS ----------------
 with tab_live:
+    st.subheader("Live Charts")
     if len(st.session_state.df):
         st.line_chart(st.session_state.df.set_index("ts")[METRICS])
     else:
@@ -312,108 +393,92 @@ with tab_live:
 # ---------------- ALERTS ----------------
 with tab_alerts:
     st.subheader("Alarm-Feed (neueste zuerst)")
-
-    # CSV-Export für Alerts
     if st.session_state.alarms:
-        df_alerts = pd.DataFrame(st.session_state.alarms)
-        df_alerts["equipment_id"] = st.session_state.eq_num
-        alerts_csv = df_alerts.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Export Alerts (CSV)",
-            data=alerts_csv,
-            file_name=f"alerts_{st.session_state.eq_num}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="dl_alerts_tab",
-        )
-
         for a in reversed(st.session_state.alarms[-200:]):
-            if a["level"] == "ALERT":
-                st.error(f"[{a['ts']}] {a['message']}")
-            else:
-                st.warning(f"[{a['ts']}] {a['message']}")
+            (st.error if a["level"] == "ALERT" else st.warning)(f"[{a['ts']}] {a['message']}")
     else:
         st.info("Keine Alarme.")
 
-# ---------------- SONSTIGES ----------------
+# ---------------- SONSTIGES (Vorzeigen) ----------------
 with tab_misc:
-    st.subheader("Beispiel: Entscheidungsbaum (IsolationForest)")
-
-    # Versuch, matplotlib on-demand zu laden (damit App ohne Abhängigkeit weiterläuft)
-    MATPLOTLIB_OK = True
+    st.subheader("IsolationForest – Normal vs. Anomalie (Illustration)")
     try:
         import matplotlib.pyplot as plt
         from matplotlib.patches import FancyBboxPatch, ArrowStyle
-        from matplotlib import patheffects
-    except Exception:
-        MATPLOTLIB_OK = False
 
-    if MATPLOTLIB_OK:
-        fig, ax = plt.subplots(figsize=(8,4))
-        ax.axis("off")
+        # Scatter: Normal vs. Anomalie
+        rng = np.random.default_rng(42)
+        npts = 150
+        temp_norm = 50 + rng.normal(0, 2.0, npts)
+        curr_norm = 120 + rng.normal(0, 3.0, npts)
+        anom_temp, anom_curr = 65.0, 120.0
 
-        def add_box(ax, xy, text):
-            box = FancyBboxPatch(xy, 0.38, 0.18, boxstyle="round,pad=0.02", fc="#E6F2FF", ec="#3973AC", lw=1.5)
-            ax.add_patch(box)
-            tx = ax.text(xy[0]+0.19, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold")
-            tx.set_path_effects([patheffects.withStroke(linewidth=3, foreground="white")])
-
-        # Knoten
-        add_box(ax, (0.05, 0.65), "Temperatur < 50 °C?")
-        add_box(ax, (0.05, 0.30), "Ja → Spannung > 600 V?")
-        add_box(ax, (0.55, 0.30), "Nein → normaler Bereich")
-        add_box(ax, (0.05, 0.02), "Ja → normal")
-        add_box(ax, (0.40, 0.02), "Nein → Ausreißer")
-
-        # Pfeile
-        arrow = ArrowStyle("-|>", head_length=1.0, head_width=0.6)
-        ax.annotate("", xy=(0.24,0.39), xytext=(0.24,0.65), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-        ax.annotate("", xy=(0.55,0.39), xytext=(0.24,0.65), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-        ax.annotate("", xy=(0.24,0.11), xytext=(0.24,0.30), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-        ax.annotate("", xy=(0.40,0.11), xytext=(0.24,0.30), arrowprops=dict(arrowstyle=arrow, lw=1.5, color="#444"))
-
-        st.pyplot(fig, use_container_width=True)
-        st.caption("IsolationForest nutzt viele solcher zufälligen Entscheidungsbäume. Normale Punkte brauchen mehrere Trennschritte, Ausreißer werden schnell isoliert.")
+        fig_sc, ax_sc = plt.subplots(figsize=(8,5))
+        ax_sc.scatter(temp_norm, curr_norm, s=25, label="Normal")
+        ax_sc.scatter([anom_temp],[anom_curr], s=80, marker="x", linewidths=2.5, label="Anomalie")
+        ax_sc.annotate("Anomalie", xy=(anom_temp, anom_curr),
+                       xytext=(anom_temp-7, anom_curr+8),
+                       arrowprops=dict(arrowstyle="->", lw=1.5))
+        ax_sc.set_xlabel("Temperatur (°C)")
+        ax_sc.set_ylabel("Strom (A)")
+        ax_sc.legend()
+        st.pyplot(fig_sc, use_container_width=True)
+        st.caption("Goldene Punkte = normales Verhalten. Rotes ✗ = Ausreißer (passt nicht ins gelernte Muster).")
 
         st.markdown("---")
-        st.subheader("Beispiel: Zeitreihe mit Ausreißer")
+        st.subheader("Entscheidungsbaum – vereinfachte Logik (Illustration)")
+        fig, ax = plt.subplots(figsize=(9,4))
+        ax.axis("off")
+        def box(xy, text):
+            b = FancyBboxPatch(xy, 0.36, 0.18, boxstyle="round,pad=0.02", fc="#E6F2FF", ec="#3973AC", lw=1.5)
+            ax.add_patch(b)
+            ax.text(xy[0]+0.18, xy[1]+0.09, text, ha="center", va="center", fontsize=9, weight="bold")
+        box((0.05, 0.62), "Spannung > 600 V?")
+        box((0.48, 0.62), "Ja → Ausreißer")
+        box((0.05, 0.32), "Nein → Temp < 50 °C?")
+        box((0.05, 0.02), "Ja → Normal")
+        box((0.48, 0.32), "Nein → Vibration > 0.8?")
+        box((0.48, 0.02), "Ja → Ausreißer")
+        box((0.78, 0.02), "Nein → Normal")
+        arr = ArrowStyle("-|>", head_length=1.0, head_width=0.6)
+        ax.annotate("", xy=(0.41,0.41), xytext=(0.23,0.62), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.48,0.70), xytext=(0.23,0.70), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.23,0.11), xytext=(0.23,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.66,0.41), xytext=(0.41,0.41), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.66,0.11), xytext=(0.66,0.32), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        ax.annotate("", xy=(0.83,0.11), xytext=(0.66,0.11), arrowprops=dict(arrowstyle=arr, lw=1.4))
+        st.pyplot(fig, use_container_width=True)
+        st.caption("Ablauf: 1) Spannung prüfen (>600 V ⇒ Ausreißer). 2) Sonst Temperatur (<50 °C ⇒ normal). 3) Sonst Vibration prüfen (>0.8 ⇒ Ausreißer, sonst normal).")
 
-        # synthetische Reihe mit Ausreißer
-        n = 80
-        x = np.arange(n)
-        y = 45 + 0.2*np.sin(x/4) + np.random.normal(0,0.2,size=n)
-        y[55] = y.mean() + 8.0  # Ausreißer
-
-        fig2, ax2 = plt.subplots(figsize=(10,3))
-        ax2.plot(x, y, linewidth=1.5)
-        ax2.scatter([55],[y[55]], s=80, color="red", zorder=5)
-        ax2.set_xlabel("Zeit (Messpunkte)")
-        ax2.set_ylabel("Temperatur (°C)")
-        ax2.set_title("Temperatur-Verlauf – markierter Ausreißer (rot)")
-        st.pyplot(fig2, use_container_width=True)
-    else:
-        st.warning("Matplotlib ist nicht installiert. Die Beispielgrafiken werden deshalb nicht angezeigt. "
-                   "Füge `matplotlib` zur requirements.txt hinzu, um die Grafiken zu sehen.")
+    except Exception:
+        st.warning("Matplotlib fehlt – bitte `matplotlib` in requirements.txt ergänzen.")
 
     st.markdown("---")
-    st.subheader("Beispiele: Excel-Exports (Vorschau)")
+    st.subheader("Beispiel-Export (eine Liste – Vorschau)")
+    st.markdown(
+        """
+**So liest du die Tabelle:**  
+- Jede Zeile ist **ein Alarm** mit **den Messwerten zum gleichen Zeitpunkt**.  
+- **level** = Stufe (WARN/ALERT), **message** = Grund.  
+- **temperature_c, vibration_rms, current_a, voltage_v, fan_rpm** = Messkontext zur Analyse.
 
-    # Beispiel-DataFrame für Alerts (so sieht CSV aus)
-    sample_alerts = pd.DataFrame(
-        [
-            {"ts":"12:01:05","level":"WARN","message":"voltage_v hoch: 602.3","equipment_id":st.session_state.eq_num},
-            {"ts":"12:03:10","level":"ALERT","message":"ML anomaly score=0.86","equipment_id":st.session_state.eq_num},
-        ]
+**Beispiel unten:**  
+- Zeile 1 = **Grenzwert-WARN** wegen **Spannung (voltage_v)** über Warn-Grenze.  
+- Zeile 2 = **ML-ALERT** vom IsolationForest (**Anomalie** erkannt).
+"""
     )
-    st.markdown("**Alerts-CSV (Struktur)**")
-    st.dataframe(sample_alerts, use_container_width=True, hide_index=True)
-
-    # Beispiel-DataFrame für Messdaten (so sieht CSV aus)
-    sample_ts = pd.DataFrame(
-        [
-            {"ts":"12:00:00","equipment_id":st.session_state.eq_num,"temperature_c":45.2,"vibration_rms":0.36,"current_a":121.0,"voltage_v":541.2,"fan_rpm":3180},
-            {"ts":"12:00:01","equipment_id":st.session_state.eq_num,"temperature_c":45.1,"vibration_rms":0.35,"current_a":120.8,"voltage_v":540.9,"fan_rpm":3195},
-        ]
-    )
-    st.markdown("**Messdaten-CSV (Struktur)**")
-    st.dataframe(sample_ts, use_container_width=True, hide_index=True)
+    preview = build_analysis_df()
+    if preview.empty:
+        ts1 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts2 = (datetime.now() + pd.Timedelta(seconds=3)).strftime("%Y-%m-%d %H:%M:%S")
+        demo = pd.DataFrame(
+            [
+                {"ts": ts1, "equipment_id": st.session_state.eq_num, "level": "WARN",  "message": "voltage_v hoch: 602.3",
+                 "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 602.3, "fan_rpm": 3180},
+                {"ts": ts2, "equipment_id": st.session_state.eq_num, "level": "ALERT", "message": "ML anomaly score=0.86",
+                 "temperature_c": 45.2, "vibration_rms": 0.36, "current_a": 121.0, "voltage_v": 541.2, "fan_rpm": 3180},
+            ]
+        )
+        st.dataframe(demo, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(preview.tail(10), use_container_width=True, hide_index=True)
