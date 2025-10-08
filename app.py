@@ -115,10 +115,12 @@ def init_db(conn: sqlite3.Connection):
         ml_cont REAL,
         ml_alert REAL
     )""")
-    # einmalige Initialzeile
     c.execute("SELECT COUNT(*) FROM control WHERE id=1")
     if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO control (id, running, eq_id, fault_cooling, fault_fan, fault_voltage, ml_window, ml_cont, ml_alert) VALUES (1, 0, ?, 0, 0, 0, 600, 0.02, 0.80)", ("10109812-01",))
+        c.execute(
+            "INSERT INTO control (id, running, eq_id, fault_cooling, fault_fan, fault_voltage, ml_window, ml_cont, ml_alert) "
+            "VALUES (1, 0, ?, 0, 0, 0, 600, 0.02, 0.80)", ("10109812-01",)
+        )
     conn.commit()
 
 def control_get(conn):
@@ -253,6 +255,20 @@ def get_db_and_worker():
 # starte DB + Worker genau einmal pro Server-Prozess
 DB_CONN, _STOP = get_db_and_worker()
 
+# ------------- NEU: sanfter Auto-Refresh der UI, solange running=1 -------------
+try:
+    ctrl_for_refresh = control_get(DB_CONN)
+    if int(ctrl_for_refresh.get("running", 0)) == 1:
+        # kompatibler Importname für viele Streamlit-Versionen
+        try:
+            from streamlit import _experimental_st_autorefresh as st_autorefresh
+        except Exception:
+            st_autorefresh = None
+        if st_autorefresh:
+            st_autorefresh(interval=1000, key="ui-autorefresh")  # 1s
+except Exception:
+    pass
+
 # ---------------- (alter) STATE – bleibt für UI-Kompatibilität bestehen ----------------
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(
@@ -301,7 +317,6 @@ with tab_settings:
     with cstart:
         ctrl_now = control_get(DB_CONN)
         running_now = bool(ctrl_now["running"])
-        # Start/Stop steuern NUR die control-Tabelle (Worker läuft unabhängig vom Tab weiter)
         if not running_now:
             if st.button("▶️ Start Simulation", use_container_width=True):
                 control_update(DB_CONN, running=1, eq_id=st.session_state.eq_num)
@@ -328,7 +343,6 @@ with tab_settings:
     with c1: st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt", value=bool(ctrl_now["fault_cooling"]))
     with c2: st.session_state.faults["fan"]     = st.checkbox("Fan Wear — Lüfter RPM sinkt", value=bool(ctrl_now["fault_fan"]))
     with c3: st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen", value=bool(ctrl_now["fault_voltage"]))
-    # in control schreiben (sofort wirksam)
     control_update(DB_CONN,
                    fault_cooling=1 if st.session_state.faults["cooling"] else 0,
                    fault_fan=1 if st.session_state.faults["fan"] else 0,
@@ -351,7 +365,6 @@ with tab_settings:
         fan_warn  = st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],   step=50.0, key="fan_warn")
         fan_alert = st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"],  step=50.0, key="fan_alert")
 
-    # >>> Legende direkt UNTER den Schwellwerten <<<
     st.markdown(
         f"""
 <div class="legend-box">
@@ -367,7 +380,6 @@ with tab_settings:
     )
 
     st.markdown("---")
-    # KI-Erklärung – Dein Text (unverändert)
     st.subheader("KI-Anomalie (IsolationForest)")
     st.markdown(
         """
@@ -392,10 +404,8 @@ with tab_settings:
     window = c1.slider("Fenstergröße (Punkte)", 200, 2000, ctrl_now["ml_window"], 50, key="ml_window")
     contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, float(ctrl_now["ml_cont"]), 0.001, key="ml_cont")
     ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, float(ctrl_now["ml_alert"]), 0.05, key="ml_thresh")
-    # in control schreiben (sofort wirksam)
     control_update(DB_CONN, ml_window=int(window), ml_cont=float(contamination), ml_alert=float(ml_alert_thresh))
 
-    # Statusanzeige (serverseitig)
     ctrl_now2 = control_get(DB_CONN)
     if ctrl_now2["running"] == 1:
         status_placeholder.success("RUNNING – Hintergrund-Simulation aktiv")
@@ -406,13 +416,11 @@ with tab_settings:
 with tab_overview:
     st.subheader("Gesamtzustand")
 
-    # Live aus DB lesen
     df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     st.session_state.df = df_live.copy()
     df_alarms = db_load_alarms(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     st.session_state.alarms = df_alarms.to_dict("records")
 
-    # Export rechts oben: eine Liste (CSV + Excel)
     exp_l, exp_r = st.columns([3,2])
     with exp_r:
         def build_analysis_df_from_db():
@@ -462,7 +470,6 @@ with tab_overview:
         k4.metric("Spannung (V)", f"{latest['voltage_v']:.1f}")
         k5.metric("Lüfter (RPM)", f"{latest['fan_rpm']:.0f}")
 
-        # Schwellen je Merkmal checken (mit Lüfter-Untergrenze)
         th_levels = []
         for k, v in defaults_from_nominals(st.session_state.eq_num).items():
             val = float(latest[k])
@@ -473,7 +480,6 @@ with tab_overview:
             else:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
-        # ML-Score schnell aus df_live schätzen (nur Anzeige; Alarme kommen aus Worker)
         def quick_ml_score(df, window, contamination):
             if len(df) < window: return None
             X = df[METRICS].astype(float).to_numpy()
@@ -487,7 +493,6 @@ with tab_overview:
             lo, hi = float(raw_train.min()), float(raw_train.max()) + 1e-9
             return float((raw_last - lo) / (hi - lo))
 
-        # aktuelle control-Parameter lesen für Schwelle/Anzeige
         cvals = control_get(DB_CONN)
         score = quick_ml_score(df_live, cvals["ml_window"], cvals["ml_cont"])
         lvl = "OK"
@@ -509,7 +514,7 @@ with tab_live:
     st.subheader("Live Charts")
     df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     if len(df_live):
-        st.line_chart(df_live.set_index("ts")[METRICS])
+        st.line_chart(df_live.set_index("ts")[METRICS], use_container_width=True)
     else:
         st.info("Noch keine Daten.")
 
@@ -530,7 +535,6 @@ with tab_misc:
         import matplotlib.pyplot as plt
         from matplotlib.patches import FancyBboxPatch, ArrowStyle
 
-        # Scatter: Normal vs. Anomalie
         rng = np.random.default_rng(42)
         npts = 150
         temp_norm = 50 + rng.normal(0, 2.0, npts)
@@ -591,7 +595,6 @@ with tab_misc:
 - Zeile 2 = **ML-ALERT** vom IsolationForest (**Anomalie** erkannt).
 """
     )
-    # kleine Vorschau aus DB
     df_alarms = db_load_alarms(DB_CONN, eq_id=st.session_state.eq_num, limit=10)
     df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     if df_alarms.empty or df_live.empty:
