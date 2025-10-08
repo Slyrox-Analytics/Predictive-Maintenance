@@ -7,7 +7,7 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
-from streamlit import rerun  # für Button-Re-Runs (ok)
+from streamlit import rerun  # für Button-Re-Runs
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
@@ -80,17 +80,35 @@ def defaults_from_nominals(eq_id: str):
         "voltage_v":     {"warn": n["voltage_v"] * 1.07,      "alert": n["voltage_v"] * 1.15},
         "fan_rpm":       {"warn": n["fan_rpm"] - 600.0,       "alert": n["fan_rpm"] - 1200.0},  # Untergrenze
     }
-
 METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 
 # ---------------- DB-UTILS: eigene Connections + WAL ----------------
 def open_db(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)  # autocommit
-    # Robust gegen Locks
+    # autocommit + robuste PRAGMAs
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=4000;")  # 4s
+    conn.execute("PRAGMA busy_timeout=4000;")
     return conn
+
+def _execute_write_retry(conn: sqlite3.Connection, sql: str, params: tuple = (), retries: int = 8, base_sleep: float = 0.05):
+    """Robuster Write mit kurzen Retries gegen 'database is locked'."""
+    for i in range(retries):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(sql, params)
+            conn.execute("COMMIT")
+            return
+        except sqlite3.OperationalError:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            time.sleep(base_sleep * (i + 1))  # linearer Backoff
+    # letzter Versuch
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(sql, params)
+    conn.execute("COMMIT")
 
 # ---------------- HINTERGRUND: DB + WORKER ----------------
 def init_db(conn: sqlite3.Connection):
@@ -151,19 +169,21 @@ def control_get(conn):
     }
 
 def control_update(conn, **kwargs):
-    if not kwargs: return
+    if not kwargs:
+        return
     sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
     vals = list(kwargs.values()) + [1]
-    conn.execute(f"UPDATE control SET {sets} WHERE id=?", vals)
+    _execute_write_retry(conn, f"UPDATE control SET {sets} WHERE id=?", tuple(vals))
 
 def db_save_measurement(conn, row):
-    conn.execute("INSERT INTO measurements VALUES (?,?,?,?,?,?,?)", (
-        row["ts"], row["equipment_id"], row["temperature_c"], row["vibration_rms"],
-        row["current_a"], row["voltage_v"], row["fan_rpm"]
-    ))
+    _execute_write_retry(conn,
+        "INSERT INTO measurements VALUES (?,?,?,?,?,?,?)",
+        (row["ts"], row["equipment_id"], row["temperature_c"], row["vibration_rms"],
+         row["current_a"], row["voltage_v"], row["fan_rpm"])
+    )
 
 def db_save_alarm(conn, ts, eq, level, msg):
-    conn.execute("INSERT INTO alarms VALUES (?,?,?,?)", (ts, eq, level, msg))
+    _execute_write_retry(conn, "INSERT INTO alarms VALUES (?,?,?,?)", (ts, eq, level, msg))
 
 def db_load_measurements(conn, limit=2000, eq_id=None):
     q = "SELECT ts, equipment_id, temperature_c, vibration_rms, current_a, voltage_v, fan_rpm FROM measurements"
@@ -176,6 +196,7 @@ def db_load_measurements(conn, limit=2000, eq_id=None):
     df = pd.read_sql(q, conn, params=params)
     if df.empty:
         return df
+    # chronologisch + ts->datetime (für Charts)
     df = df.iloc[::-1].reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"])
     return df
@@ -233,7 +254,7 @@ def sim_ml_anomaly(conn, eq_id, window, contamination):
     return float(score)
 
 def background_worker(stop_evt: threading.Event, db_path: str):
-    # Eigene Connection für den Worker (verhindert UI-Kollisionen)
+    # Eigene Connection für den Worker
     conn = open_db(db_path)
     init_db(conn)
     t = 0
@@ -261,8 +282,10 @@ def background_worker(stop_evt: threading.Event, db_path: str):
                 t += 1
             time.sleep(1)
         except sqlite3.OperationalError:
-            # Kurz warten und weiter (WAL + busy_timeout sollten es ohnehin meist abfangen)
             time.sleep(0.05)
+            continue
+        except Exception:
+            time.sleep(0.1)
             continue
     try:
         conn.close()
@@ -342,8 +365,8 @@ with tab_settings:
                 rerun()
     with cdel:
         if st.button("🗑️ Daten löschen", help="Löscht NUR Simulationsdaten & Alarmfeed. Einstellungen bleiben erhalten."):
-            DB_CONN.execute("DELETE FROM measurements")
-            DB_CONN.execute("DELETE FROM alarms")
+            _execute_write_retry(DB_CONN, "DELETE FROM measurements", ())
+            _execute_write_retry(DB_CONN, "DELETE FROM alarms", ())
             st.session_state.df = st.session_state.df.iloc[0:0]
             st.session_state.alarms = []
             st.success("Daten & Alarme gelöscht. Einstellungen unverändert.")
@@ -351,7 +374,7 @@ with tab_settings:
     st.markdown("---")
 
     st.subheader("Fault Injection (während des Laufs umschaltbar)")
-    # SOFORT wirksam: direkt ins control schreiben (kein Debounce gewünscht)
+    # SOFORT wirksam: aber nur schreiben, wenn sich der Wert geändert hat
     c1, c2, c3 = st.columns(3)
     with c1:
         cooling_cb = st.checkbox("Cooling Degradation — Temperatur steigt", value=bool(ctrl_now["fault_cooling"]))
@@ -360,11 +383,17 @@ with tab_settings:
     with c3:
         volt_cb = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen", value=bool(ctrl_now["fault_voltage"]))
 
-    control_update(DB_CONN,
-                   fault_cooling=1 if cooling_cb else 0,
-                   fault_fan=1 if fan_cb else 0,
-                   fault_voltage=1 if volt_cb else 0,
-                   eq_id=st.session_state.eq_num)
+    updates = {}
+    if int(cooling_cb) != int(ctrl_now["fault_cooling"]):
+        updates["fault_cooling"] = 1 if cooling_cb else 0
+    if int(fan_cb) != int(ctrl_now["fault_fan"]):
+        updates["fault_fan"] = 1 if fan_cb else 0
+    if int(volt_cb) != int(ctrl_now["fault_voltage"]):
+        updates["fault_voltage"] = 1 if volt_cb else 0
+    if (ctrl_now.get("eq_id") or "") != st.session_state.eq_num:
+        updates["eq_id"] = st.session_state.eq_num
+    if updates:
+        control_update(DB_CONN, **updates)
 
     st.markdown("---")
     st.subheader("Schwellwerte")
@@ -426,7 +455,6 @@ with tab_settings:
                 ml_alert=float(st.session_state.ml_alert_tmp),
             )
             st.success("ML-Parameter übernommen.")
-            # Kein rerun nötig; Hintergrund greift neue Werte im nächsten Tick auf.
     with ucol2:
         st.caption(f"Aktive Werte: window={ctrl_now['ml_window']}, contamination={ctrl_now['ml_cont']:.3f}, alert={ctrl_now['ml_alert']:.2f}")
 
