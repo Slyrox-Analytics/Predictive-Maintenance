@@ -7,11 +7,11 @@ import numpy as np
 import streamlit as st
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
-from streamlit import rerun  # noch vorhanden, aber der UI-Loop ist jetzt deaktiviert
+from streamlit import rerun  # für Button-Re-Runs (ok)
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
-# ---------- SAP/Fiori-ähnliches Styling (leicht, unaufdringlich) ----------
+# ---------- SAP/Fiori-ähnliches Styling ----------
 st.markdown("""
 <style>
 :root {
@@ -63,7 +63,7 @@ NOMINALS = {
         "voltage_v": 540.0,
         "fan_rpm": 3200.0,
     },
-    "10109812-02": {  # XD2 (identisch; bei Bedarf später separat anpassen)
+    "10109812-02": {  # XD2
         "temperature_c": 45.0,
         "vibration_rms": 0.35,
         "current_a": 120.0,
@@ -115,11 +115,13 @@ def init_db(conn: sqlite3.Connection):
         ml_cont REAL,
         ml_alert REAL
     )""")
+    # einmalige Initialzeile
     c.execute("SELECT COUNT(*) FROM control WHERE id=1")
     if c.fetchone()[0] == 0:
         c.execute(
             "INSERT INTO control (id, running, eq_id, fault_cooling, fault_fan, fault_voltage, ml_window, ml_cont, ml_alert) "
-            "VALUES (1, 0, ?, 0, 0, 0, 600, 0.02, 0.80)", ("10109812-01",)
+            "VALUES (1, 0, ?, 0, 0, 0, 600, 0.02, 0.80)",
+            ("10109812-01",)
         )
     conn.commit()
 
@@ -167,8 +169,12 @@ def db_load_measurements(conn, limit=2000, eq_id=None):
     q += " ORDER BY ts DESC LIMIT ?"
     params.append(limit)
     df = pd.read_sql(q, conn, params=params)
-    if df.empty: return df
-    return df.iloc[::-1].reset_index(drop=True)
+    if df.empty:
+        return df
+    # chronologisch sortieren und ts -> datetime (WICHTIG für Live-Charts)
+    df = df.iloc[::-1].reset_index(drop=True)
+    df["ts"] = pd.to_datetime(df["ts"])
+    return df
 
 def db_load_alarms(conn, limit=2000, eq_id=None):
     q = "SELECT ts, equipment_id, level, message FROM alarms"
@@ -255,33 +261,19 @@ def get_db_and_worker():
 # starte DB + Worker genau einmal pro Server-Prozess
 DB_CONN, _STOP = get_db_and_worker()
 
-# ------------- NEU: sanfter Auto-Refresh der UI, solange running=1 -------------
-try:
-    ctrl_for_refresh = control_get(DB_CONN)
-    if int(ctrl_for_refresh.get("running", 0)) == 1:
-        # kompatibler Importname für viele Streamlit-Versionen
-        try:
-            from streamlit import _experimental_st_autorefresh as st_autorefresh
-        except Exception:
-            st_autorefresh = None
-        if st_autorefresh:
-            st_autorefresh(interval=1000, key="ui-autorefresh")  # 1s
-except Exception:
-    pass
-
-# ---------------- (alter) STATE – bleibt für UI-Kompatibilität bestehen ----------------
+# ---------------- (alter) STATE für UI-Kompatibilität ----------------
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(
         columns=["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
     )
 if "alarms" not in st.session_state:
-    st.session_state.alarms = []   # dicts: {"ts","level","message"}
+    st.session_state.alarms = []
 if "running" not in st.session_state:
     st.session_state.running = False
 if "faults" not in st.session_state:
     st.session_state.faults = {"cooling": False, "fan": False, "voltage": False}
 if "eq_num" not in st.session_state:
-    st.session_state.eq_num = "10109812-01"  # Default
+    st.session_state.eq_num = "10109812-01"
 
 # ---------------- HEADER ----------------
 colL, colR = st.columns([1,1])
@@ -302,7 +294,6 @@ with colR:
 
 st.markdown("---")
 
-# --- abgeleitete, aktuelle Grenzwerte aus SOLL des ausgewählten Geräts
 THRESHOLDS = defaults_from_nominals(st.session_state.eq_num)
 
 # ---------------- TABS ----------------
@@ -415,7 +406,6 @@ with tab_settings:
 # ---------------- OVERVIEW ----------------
 with tab_overview:
     st.subheader("Gesamtzustand")
-
     df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     st.session_state.df = df_live.copy()
     df_alarms = db_load_alarms(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
@@ -470,16 +460,6 @@ with tab_overview:
         k4.metric("Spannung (V)", f"{latest['voltage_v']:.1f}")
         k5.metric("Lüfter (RPM)", f"{latest['fan_rpm']:.0f}")
 
-        th_levels = []
-        for k, v in defaults_from_nominals(st.session_state.eq_num).items():
-            val = float(latest[k])
-            if k == "fan_rpm":
-                warn_thr  = st.session_state.get("fan_warn", v["warn"])
-                alert_thr = st.session_state.get("fan_alert", v["alert"])
-                th_levels.append("ALERT" if val < alert_thr else "WARN" if val < warn_thr else "OK")
-            else:
-                th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
-
         def quick_ml_score(df, window, contamination):
             if len(df) < window: return None
             X = df[METRICS].astype(float).to_numpy()
@@ -498,7 +478,7 @@ with tab_overview:
         lvl = "OK"
         if score is not None:
             if score >= cvals["ml_alert"]: lvl = "ALERT"
-            elif score >= (cvals["ml_alert"] * 0.7): lvl = max(lvl, "WARN")
+            elif score >= (cvals["ml_alert"] * 0.7): lvl = "WARN"
 
         cA, cB = st.columns([1,3])
         with cA:
@@ -514,6 +494,7 @@ with tab_live:
     st.subheader("Live Charts")
     df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     if len(df_live):
+        # ts ist jetzt datetime -> saubere Zeitachse
         st.line_chart(df_live.set_index("ts")[METRICS], use_container_width=True)
     else:
         st.info("Noch keine Daten.")
@@ -615,3 +596,12 @@ with tab_misc:
             on=["ts","equipment_id"], how="left"
         )
         st.dataframe(preview.tail(10), use_container_width=True, hide_index=True)
+
+# --------- AUTO-REFRESH: solange running=1, alle 1 s neu rendern ---------
+try:
+    _ctrl = control_get(DB_CONN)
+    if int(_ctrl.get("running", 0)) == 1:
+        time.sleep(1)   # Tickrate
+        st.rerun()
+except Exception:
+    pass
