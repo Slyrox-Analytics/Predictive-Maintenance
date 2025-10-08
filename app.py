@@ -1,11 +1,13 @@
 import time
 import io
+import sqlite3
+import threading
 import pandas as pd
 import numpy as np
 import streamlit as st
 from datetime import datetime
 from sklearn.ensemble import IsolationForest
-from streamlit import rerun  # <<< NEU: statt st.experimental_rerun()
+from streamlit import rerun  # noch vorhanden, aber der UI-Loop ist jetzt deaktiviert
 
 st.set_page_config(page_title="Predictive Maintenance – Rectifier", page_icon="🛠️", layout="wide")
 
@@ -79,7 +81,179 @@ def defaults_from_nominals(eq_id: str):
         "fan_rpm":       {"warn": n["fan_rpm"] - 600.0,       "alert": n["fan_rpm"] - 1200.0},  # Untergrenze
     }
 
-# ---------------- STATE ----------------
+METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
+
+# ---------------- HINTERGRUND: DB + WORKER ----------------
+def init_db(conn: sqlite3.Connection):
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS measurements (
+        ts TEXT,
+        equipment_id TEXT,
+        temperature_c REAL,
+        vibration_rms REAL,
+        current_a REAL,
+        voltage_v REAL,
+        fan_rpm REAL
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS alarms (
+        ts TEXT,
+        equipment_id TEXT,
+        level TEXT,
+        message TEXT
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS control (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        running INTEGER DEFAULT 0,
+        eq_id TEXT,
+        fault_cooling INTEGER DEFAULT 0,
+        fault_fan INTEGER DEFAULT 0,
+        fault_voltage INTEGER DEFAULT 0,
+        ml_window INTEGER,
+        ml_cont REAL,
+        ml_alert REAL
+    )""")
+    # einmalige Initialzeile
+    c.execute("SELECT COUNT(*) FROM control WHERE id=1")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO control (id, running, eq_id, fault_cooling, fault_fan, fault_voltage, ml_window, ml_cont, ml_alert) VALUES (1, 0, ?, 0, 0, 0, 600, 0.02, 0.80)", ("10109812-01",))
+    conn.commit()
+
+def control_get(conn):
+    c = conn.cursor()
+    c.execute("SELECT running, eq_id, fault_cooling, fault_fan, fault_voltage, ml_window, ml_cont, ml_alert FROM control WHERE id=1")
+    row = c.fetchone()
+    if not row:
+        return {"running":0,"eq_id":"10109812-01","fault_cooling":0,"fault_fan":0,"fault_voltage":0,"ml_window":600,"ml_cont":0.02,"ml_alert":0.80}
+    return {
+        "running": int(row[0]),
+        "eq_id": row[1],
+        "fault_cooling": int(row[2]),
+        "fault_fan": int(row[3]),
+        "fault_voltage": int(row[4]),
+        "ml_window": int(row[5] or 600),
+        "ml_cont": float(row[6] or 0.02),
+        "ml_alert": float(row[7] or 0.80),
+    }
+
+def control_update(conn, **kwargs):
+    if not kwargs: return
+    sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
+    vals = list(kwargs.values()) + [1]
+    conn.execute(f"UPDATE control SET {sets} WHERE id=?", vals)
+    conn.commit()
+
+def db_save_measurement(conn, row):
+    conn.execute("INSERT INTO measurements VALUES (?,?,?,?,?,?,?)", (
+        row["ts"], row["equipment_id"], row["temperature_c"], row["vibration_rms"],
+        row["current_a"], row["voltage_v"], row["fan_rpm"]
+    ))
+    conn.commit()
+
+def db_save_alarm(conn, ts, eq, level, msg):
+    conn.execute("INSERT INTO alarms VALUES (?,?,?,?)", (ts, eq, level, msg))
+    conn.commit()
+
+def db_load_measurements(conn, limit=2000, eq_id=None):
+    q = "SELECT ts, equipment_id, temperature_c, vibration_rms, current_a, voltage_v, fan_rpm FROM measurements"
+    params = []
+    if eq_id:
+        q += " WHERE equipment_id=?"
+        params.append(eq_id)
+    q += " ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+    df = pd.read_sql(q, conn, params=params)
+    if df.empty: return df
+    return df.iloc[::-1].reset_index(drop=True)
+
+def db_load_alarms(conn, limit=2000, eq_id=None):
+    q = "SELECT ts, equipment_id, level, message FROM alarms"
+    params = []
+    if eq_id:
+        q += " WHERE equipment_id=?"
+        params.append(eq_id)
+    q += " ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+    return pd.read_sql(q, conn, params=params)
+
+def sim_generate_sample(eq_id: str, t: int, faults: dict):
+    base = NOMINALS[eq_id].copy()
+    if faults.get("cooling"): base["temperature_c"] += 0.01 * t
+    if faults.get("fan"):     base["fan_rpm"] -= 0.5 * t
+    if faults.get("voltage"): base["voltage_v"] += 20 * np.sin(t / 3.0)
+    base["temperature_c"] += float(np.random.uniform(-0.2, 0.2))
+    base["vibration_rms"] += float(np.random.uniform(-0.02, 0.02))
+    base["current_a"]     += float(np.random.uniform(-2, 2))
+    base["voltage_v"]     += float(np.random.uniform(-1.5, 1.5))
+    base["fan_rpm"]       += float(np.random.uniform(-30, 30))
+    return base
+
+def sim_check_thresholds(conn, eq_id, vals, ts):
+    TH = defaults_from_nominals(eq_id)
+    for k, v in TH.items():
+        val = float(vals[k])
+        if k == "fan_rpm":
+            if val < v["alert"]:
+                db_save_alarm(conn, ts, eq_id, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
+            elif val < v["warn"]:
+                db_save_alarm(conn, ts, eq_id, "WARN", f"{k} niedrig: {val:.1f} RPM")
+        else:
+            if val > v["alert"]:
+                db_save_alarm(conn, ts, eq_id, "ALERT", f"{k} zu hoch: {val:.1f}")
+            elif val > v["warn"]:
+                db_save_alarm(conn, ts, eq_id, "WARN", f"{k} hoch: {val:.1f}")
+
+def sim_ml_anomaly(conn, eq_id, window, contamination):
+    df = db_load_measurements(conn, limit=window, eq_id=eq_id)
+    if len(df) < window: return None
+    X = df[METRICS].astype(float).to_numpy()
+    mu = X.mean(axis=0); sigma = X.std(axis=0); sigma[sigma == 0] = 1e-6
+    Z = (X - mu) / sigma
+    Z_train, z_last = Z[:-1], Z[-1].reshape(1, -1)
+    model = IsolationForest(contamination=float(contamination), random_state=42)
+    model.fit(Z_train)
+    raw_last  = -model.decision_function(z_last)[0]
+    raw_train = -model.decision_function(Z_train)
+    lo, hi = float(raw_train.min()), float(raw_train.max()) + 1e-9
+    score = (raw_last - lo) / (hi - lo)
+    return float(score)
+
+def background_worker(conn: sqlite3.Connection, stop_evt: threading.Event):
+    t = 0
+    while not stop_evt.is_set():
+        ctrl = control_get(conn)
+        if ctrl["running"] == 1:
+            eq_id = ctrl["eq_id"] or "10109812-01"
+            faults = {"cooling": bool(ctrl["fault_cooling"]), "fan": bool(ctrl["fault_fan"]), "voltage": bool(ctrl["fault_voltage"])}
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            vals = sim_generate_sample(eq_id, t, faults)
+            row = {"ts": ts, "equipment_id": eq_id, **vals}
+            db_save_measurement(conn, row)
+            sim_check_thresholds(conn, eq_id, vals, ts)
+            score = sim_ml_anomaly(conn, eq_id, window=ctrl["ml_window"], contamination=ctrl["ml_cont"])
+            if score is not None:
+                if score >= ctrl["ml_alert"]:
+                    db_save_alarm(conn, ts, eq_id, "ALERT", f"ML anomaly score={score:.2f}")
+                elif score >= (ctrl["ml_alert"] * 0.7):
+                    db_save_alarm(conn, ts, eq_id, "WARN", f"ML anomaly score={score:.2f}")
+            t += 1
+        time.sleep(1)
+
+@st.cache_resource
+def get_db_and_worker():
+    conn = sqlite3.connect("data.db", check_same_thread=False)
+    init_db(conn)
+    stop_evt = threading.Event()
+    thread = threading.Thread(target=background_worker, args=(conn, stop_evt), daemon=True)
+    thread.start()
+    return conn, stop_evt
+
+# starte DB + Worker genau einmal pro Server-Prozess
+DB_CONN, _STOP = get_db_and_worker()
+
+# ---------------- (alter) STATE – bleibt für UI-Kompatibilität bestehen ----------------
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame(
         columns=["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
@@ -92,8 +266,6 @@ if "faults" not in st.session_state:
     st.session_state.faults = {"cooling": False, "fan": False, "voltage": False}
 if "eq_num" not in st.session_state:
     st.session_state.eq_num = "10109812-01"  # Default
-
-METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 
 # ---------------- HEADER ----------------
 colL, colR = st.columns([1,1])
@@ -127,16 +299,25 @@ with tab_settings:
     st.subheader("Simulation Control")
     cstart, cdel = st.columns([2,1])
     with cstart:
-        if not st.session_state.running:
+        ctrl_now = control_get(DB_CONN)
+        running_now = bool(ctrl_now["running"])
+        # Start/Stop steuern NUR die control-Tabelle (Worker läuft unabhängig vom Tab weiter)
+        if not running_now:
             if st.button("▶️ Start Simulation", use_container_width=True):
-                st.session_state.running = True
-                rerun()  # <<< vorher st.experimental_rerun()
+                control_update(DB_CONN, running=1, eq_id=st.session_state.eq_num)
+                st.success("Hintergrund-Simulation gestartet.")
+                rerun()
         else:
             if st.button("⏹ Stop Simulation", use_container_width=True):
-                st.session_state.running = False
+                control_update(DB_CONN, running=0)
+                st.warning("Hintergrund-Simulation gestoppt.")
+                rerun()
     with cdel:
         if st.button("🗑️ Daten löschen", help="Löscht NUR Simulationsdaten & Alarmfeed. Einstellungen bleiben erhalten."):
-            st.session_state.df = pd.DataFrame(columns=st.session_state.df.columns)
+            DB_CONN.execute("DELETE FROM measurements")
+            DB_CONN.execute("DELETE FROM alarms")
+            DB_CONN.commit()
+            st.session_state.df = st.session_state.df.iloc[0:0]
             st.session_state.alarms = []
             st.success("Daten & Alarme gelöscht. Einstellungen unverändert.")
 
@@ -144,25 +325,31 @@ with tab_settings:
 
     st.subheader("Fault Injection (während des Laufs umschaltbar)")
     c1, c2, c3 = st.columns(3)
-    with c1: st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt")
-    with c2: st.session_state.faults["fan"]     = st.checkbox("Fan Wear — Lüfter RPM sinkt")
-    with c3: st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen")
+    with c1: st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt", value=bool(ctrl_now["fault_cooling"]))
+    with c2: st.session_state.faults["fan"]     = st.checkbox("Fan Wear — Lüfter RPM sinkt", value=bool(ctrl_now["fault_fan"]))
+    with c3: st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen", value=bool(ctrl_now["fault_voltage"]))
+    # in control schreiben (sofort wirksam)
+    control_update(DB_CONN,
+                   fault_cooling=1 if st.session_state.faults["cooling"] else 0,
+                   fault_fan=1 if st.session_state.faults["fan"] else 0,
+                   fault_voltage=1 if st.session_state.faults["voltage"] else 0,
+                   eq_id=st.session_state.eq_num)
 
     st.markdown("---")
     st.subheader("Schwellwerte")
     r1, r2 = st.columns([3,3])
     with r1:
-        st.number_input("Temperatur WARN (°C)",  value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
-        st.number_input("Temperatur ALERT (°C)", value=THRESHOLDS["temperature_c"]["alert"], step=1.0, key="t_alert")
-        st.number_input("Vibration WARN (RMS)",  value=THRESHOLDS["vibration_rms"]["warn"], step=0.01, format="%.2f", key="vib_warn")
-        st.number_input("Vibration ALERT (RMS)", value=THRESHOLDS["vibration_rms"]["alert"], step=0.01, format="%.2f", key="vib_alert")
+        t_warn  = st.number_input("Temperatur WARN (°C)",  value=THRESHOLDS["temperature_c"]["warn"], step=1.0, key="t_warn")
+        t_alert = st.number_input("Temperatur ALERT (°C)", value=THRESHOLDS["temperature_c"]["alert"], step=1.0, key="t_alert")
+        vib_warn  = st.number_input("Vibration WARN (RMS)",  value=THRESHOLDS["vibration_rms"]["warn"], step=0.01, format="%.2f", key="vib_warn")
+        vib_alert = st.number_input("Vibration ALERT (RMS)", value=THRESHOLDS["vibration_rms"]["alert"], step=0.01, format="%.2f", key="vib_alert")
     with r2:
-        st.number_input("Strom WARN (A)",        value=THRESHOLDS["current_a"]["warn"], step=1.0, key="i_warn")
-        st.number_input("Strom ALERT (A)",       value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
-        st.number_input("Spannung WARN (V)",     value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
-        st.number_input("Spannung ALERT (V)",    value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
-        st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],   step=50.0, key="fan_warn")
-        st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"],  step=50.0, key="fan_alert")
+        i_warn  = st.number_input("Strom WARN (A)",        value=THRESHOLDS["current_a"]["warn"], step=1.0, key="i_warn")
+        i_alert = st.number_input("Strom ALERT (A)",       value=THRESHOLDS["current_a"]["alert"], step=1.0, key="i_alert")
+        u_warn  = st.number_input("Spannung WARN (V)",     value=THRESHOLDS["voltage_v"]["warn"], step=1.0, key="u_warn")
+        u_alert = st.number_input("Spannung ALERT (V)",    value=THRESHOLDS["voltage_v"]["alert"], step=1.0, key="u_alert")
+        fan_warn  = st.number_input("Lüfter WARN (RPM, Untergrenze)",  value=THRESHOLDS["fan_rpm"]["warn"],   step=50.0, key="fan_warn")
+        fan_alert = st.number_input("Lüfter ALERT (RPM, Untergrenze)", value=THRESHOLDS["fan_rpm"]["alert"],  step=50.0, key="fan_alert")
 
     # >>> Legende direkt UNTER den Schwellwerten <<<
     st.markdown(
@@ -202,130 +389,46 @@ with tab_settings:
 """
     )
     c1, c2, c3 = st.columns(3)
-    window = c1.slider("Fenstergröße (Punkte)", 200, 2000, 600, 50, key="ml_window")
-    contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, 0.02, 0.001, key="ml_cont")
-    ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, 0.80, 0.05, key="ml_thresh")
+    window = c1.slider("Fenstergröße (Punkte)", 200, 2000, ctrl_now["ml_window"], 50, key="ml_window")
+    contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, float(ctrl_now["ml_cont"]), 0.001, key="ml_cont")
+    ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, float(ctrl_now["ml_alert"]), 0.05, key="ml_thresh")
+    # in control schreiben (sofort wirksam)
+    control_update(DB_CONN, ml_window=int(window), ml_cont=float(contamination), ml_alert=float(ml_alert_thresh))
 
-    st.markdown("---")
-    st.markdown("### Erläuterungen zu den Reglern")
-    st.markdown("""
-**Fenstergröße (Punkte)**  
-➡️ Wie viele vergangene Messwerte die KI als Referenz nimmt (z. B. 600 = die letzten 600 Punkte).  
-• Großes Fenster = stabiler, reagiert langsamer.  
-• Kleines Fenster = reagiert schneller, aber empfindlicher.  
-
-**Kontamination (erwartete Ausreißer)**  
-➡️ Erwarteter Anteil an Ausreißern im Normalbetrieb.  
-• Beispiel: 0.02 = 2 % der Punkte dürfen unauffällig abweichen, ohne sofort Alarm auszulösen.  
-• Klein = empfindlicher (erkennt schneller ungewöhnliche Punkte).  
-• Groß = toleranter (meldet nur stärkere Abweichungen).  
-
-**ML-Alert-Schwelle (0–1)**  
-➡️ Ab welchem Anomalie-Score das Machine-Learning-Modell (IsolationForest) Alarm gibt.  
-• Score nahe 0 = Punkt ist normal.  
-• Score nahe 1 = Punkt ist sehr ungewöhnlich.  
-• Liegt der Score über dieser Schwelle (z. B. 0.8), wird ein Alarm im Dashboard ausgelöst.
-""")
-
-# ---------------- FUNKTIONEN ----------------
-def generate_sample(t: int):
-    base = {"temperature_c":45.0, "vibration_rms":0.35, "current_a":120.0, "voltage_v":540.0, "fan_rpm":3200.0}
-    if st.session_state.faults.get("cooling"): base["temperature_c"] += 0.01 * t
-    if st.session_state.faults.get("fan"):     base["fan_rpm"] -= 0.5 * t
-    if st.session_state.faults.get("voltage"): base["voltage_v"] += 20 * np.sin(t / 3.0)
-    base["temperature_c"] += np.random.uniform(-0.2, 0.2)
-    base["vibration_rms"] += np.random.uniform(-0.02, 0.02)
-    base["current_a"]     += np.random.uniform(-2, 2)
-    base["voltage_v"]     += np.random.uniform(-1.5, 1.5)
-    base["fan_rpm"]       += np.random.uniform(-30, 30)
-    return base
-
-def push_alarm(ts, level, msg):
-    st.session_state.alarms.append({"ts": ts, "level": level, "message": msg})
-
-def check_thresholds(vals, ts):
-    for k, v in THRESHOLDS.items():
-        val = float(vals[k])
-        if k == "fan_rpm":
-            warn_thr  = st.session_state.get("fan_warn", THRESHOLDS["fan_rpm"]["warn"])
-            alert_thr = st.session_state.get("fan_alert", THRESHOLDS["fan_rpm"]["alert"])
-            if val < alert_thr: push_alarm(ts, "ALERT", f"{k} zu niedrig: {val:.1f} RPM")
-            elif val < warn_thr: push_alarm(ts, "WARN", f"{k} niedrig: {val:.1f} RPM")
-        else:
-            if val > v["alert"]: push_alarm(ts, "ALERT", f"{k} zu hoch: {val:.1f}")
-            elif val > v["warn"]: push_alarm(ts, "WARN", f"{k} hoch: {val:.1f}")
-
-def ml_anomaly(df: pd.DataFrame, window: int, contamination: float):
-    if len(df) < window: return None, None
-    data = df.iloc[-window:].copy()
-    X = data[METRICS].astype(float).to_numpy()
-    mu = X.mean(axis=0); sigma = X.std(axis=0); sigma[sigma == 0] = 1e-6
-    Z = (X - mu) / sigma
-    Z_train, z_last = Z[:-1], Z[-1].reshape(1, -1)
-    model = IsolationForest(contamination=contamination, random_state=42)
-    model.fit(Z_train)
-    raw_last  = -model.decision_function(z_last)[0]
-    raw_train = -model.decision_function(Z_train)
-    lo, hi = float(raw_train.min()), float(raw_train.max()) + 1e-9
-    score = (raw_last - lo) / (hi - lo)
-    return float(score), {"mu": mu.tolist(), "sigma": sigma.tolist()}
-
-def overall_level(th_levels, ml_score, ml_thresh):
-    order = {"OK": 0, "WARN": 1, "ALERT": 2}
-    level = "OK"
-    for lv in th_levels:
-        if order[lv] > order[level]: level = lv
-    if ml_score is not None:
-        if ml_score >= ml_thresh: level = "ALERT"
-        elif ml_score >= (ml_thresh * 0.7) and order["WARN"] > order[level]: level = "WARN"
-    return level
-
-def build_analysis_df():
-    """Eine Liste: jeder Alarm + Mess-Kontext am selben ts."""
-    if not st.session_state.alarms:
-        return pd.DataFrame(columns=[
-            "ts","equipment_id","level","message",
-            "temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"
-        ])
-    df_alerts = pd.DataFrame(st.session_state.alarms).copy()
-    df_alerts["equipment_id"] = st.session_state.eq_num
-    df_ts = st.session_state.df.copy()
-    merged = df_alerts.merge(
-        df_ts[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
-        on=["ts","equipment_id"], how="left"
-    )
-    cols = ["ts","equipment_id","level","message","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
-    return merged.reindex(columns=cols)
-
-# ---------------- LIVE LOOP ----------------
-if st.session_state.running:
-    t = len(st.session_state.df)
-    vals = generate_sample(t)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = {"ts": ts, "equipment_id": st.session_state.eq_num, **vals}
-    st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
-
-    check_thresholds(vals, ts)
-
-    score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
-    if score is not None:
-        if score >= ml_alert_thresh: push_alarm(ts, "ALERT", f"ML anomaly score={score:.2f}")
-        elif score >= ml_alert_thresh * 0.7: push_alarm(ts, "WARN", f"ML anomaly score={score:.2f}")
-
-    status_placeholder.success(f"RUNNING – Last sample @ {ts}")
-    time.sleep(1)
-    rerun()  # <<< vorher st.experimental_rerun()
-else:
-    status_placeholder.warning("Simulation gestoppt")
+    # Statusanzeige (serverseitig)
+    ctrl_now2 = control_get(DB_CONN)
+    if ctrl_now2["running"] == 1:
+        status_placeholder.success("RUNNING – Hintergrund-Simulation aktiv")
+    else:
+        status_placeholder.warning("Simulation gestoppt (Hintergrund-Worker wartet)")
 
 # ---------------- OVERVIEW ----------------
 with tab_overview:
     st.subheader("Gesamtzustand")
 
+    # Live aus DB lesen
+    df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
+    st.session_state.df = df_live.copy()
+    df_alarms = db_load_alarms(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
+    st.session_state.alarms = df_alarms.to_dict("records")
+
     # Export rechts oben: eine Liste (CSV + Excel)
     exp_l, exp_r = st.columns([3,2])
     with exp_r:
-        analysis_df = build_analysis_df()
+        def build_analysis_df_from_db():
+            if df_alarms.empty:
+                return pd.DataFrame(columns=[
+                    "ts","equipment_id","level","message",
+                    "temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"
+                ])
+            merged = df_alarms.merge(
+                df_live[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
+                on=["ts","equipment_id"], how="left"
+            )
+            cols = ["ts","equipment_id","level","message","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
+            return merged.reindex(columns=cols)
+
+        analysis_df = build_analysis_df_from_db()
         st.download_button(
             "⬇️ Export Analyse (CSV)",
             data=analysis_df.to_csv(index=False).encode("utf-8"),
@@ -350,8 +453,8 @@ with tab_overview:
         except Exception:
             st.info("Für Excel-Export `openpyxl` in requirements.txt ergänzen (z. B. openpyxl==3.1.5).")
 
-    if len(st.session_state.df):
-        latest = st.session_state.df.iloc[-1]
+    if len(df_live):
+        latest = df_live.iloc[-1]
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Temperatur (°C)", f"{latest['temperature_c']:.1f}")
         k2.metric("Vibration (RMS)", f"{latest['vibration_rms']:.2f}")
@@ -370,8 +473,27 @@ with tab_overview:
             else:
                 th_levels.append("ALERT" if val > v["alert"] else "WARN" if val > v["warn"] else "OK")
 
-        score, _ = ml_anomaly(st.session_state.df, window=window, contamination=contamination)
-        lvl = overall_level(th_levels, score, ml_alert_thresh)
+        # ML-Score schnell aus df_live schätzen (nur Anzeige; Alarme kommen aus Worker)
+        def quick_ml_score(df, window, contamination):
+            if len(df) < window: return None
+            X = df[METRICS].astype(float).to_numpy()
+            mu = X.mean(axis=0); sigma = X.std(axis=0); sigma[sigma == 0] = 1e-6
+            Z = (X - mu) / sigma
+            Z_train, z_last = Z[:-1], Z[-1].reshape(1, -1)
+            model = IsolationForest(contamination=float(contamination), random_state=42)
+            model.fit(Z_train)
+            raw_last  = -model.decision_function(z_last)[0]
+            raw_train = -model.decision_function(Z_train)
+            lo, hi = float(raw_train.min()), float(raw_train.max()) + 1e-9
+            return float((raw_last - lo) / (hi - lo))
+
+        # aktuelle control-Parameter lesen für Schwelle/Anzeige
+        cvals = control_get(DB_CONN)
+        score = quick_ml_score(df_live, cvals["ml_window"], cvals["ml_cont"])
+        lvl = "OK"
+        if score is not None:
+            if score >= cvals["ml_alert"]: lvl = "ALERT"
+            elif score >= (cvals["ml_alert"] * 0.7): lvl = max(lvl, "WARN")
 
         cA, cB = st.columns([1,3])
         with cA:
@@ -385,16 +507,18 @@ with tab_overview:
 # ---------------- LIVE CHARTS ----------------
 with tab_live:
     st.subheader("Live Charts")
-    if len(st.session_state.df):
-        st.line_chart(st.session_state.df.set_index("ts")[METRICS])
+    df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
+    if len(df_live):
+        st.line_chart(df_live.set_index("ts")[METRICS])
     else:
         st.info("Noch keine Daten.")
 
 # ---------------- ALERTS ----------------
 with tab_alerts:
     st.subheader("Alarm-Feed (neueste zuerst)")
-    if st.session_state.alarms:
-        for a in reversed(st.session_state.alarms[-200:]):
+    df_alarms = db_load_alarms(DB_CONN, eq_id=st.session_state.eq_num, limit=500)
+    if not df_alarms.empty:
+        for _, a in df_alarms.iloc[::-1].iterrows():
             (st.error if a["level"] == "ALERT" else st.warning)(f"[{a['ts']}] {a['message']}")
     else:
         st.info("Keine Alarme.")
@@ -467,8 +591,10 @@ with tab_misc:
 - Zeile 2 = **ML-ALERT** vom IsolationForest (**Anomalie** erkannt).
 """
     )
-    preview = build_analysis_df()
-    if preview.empty:
+    # kleine Vorschau aus DB
+    df_alarms = db_load_alarms(DB_CONN, eq_id=st.session_state.eq_num, limit=10)
+    df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
+    if df_alarms.empty or df_live.empty:
         ts1 = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ts2 = (datetime.now() + pd.Timedelta(seconds=3)).strftime("%Y-%m-%d %H:%M:%S")
         demo = pd.DataFrame(
@@ -481,4 +607,8 @@ with tab_misc:
         )
         st.dataframe(demo, use_container_width=True, hide_index=True)
     else:
+        preview = df_alarms.merge(
+            df_live[["ts","equipment_id","temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]],
+            on=["ts","equipment_id"], how="left"
+        )
         st.dataframe(preview.tail(10), use_container_width=True, hide_index=True)
