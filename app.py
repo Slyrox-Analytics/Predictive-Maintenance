@@ -83,6 +83,15 @@ def defaults_from_nominals(eq_id: str):
 
 METRICS = ["temperature_c","vibration_rms","current_a","voltage_v","fan_rpm"]
 
+# ---------------- DB-UTILS: eigene Connections + WAL ----------------
+def open_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)  # autocommit
+    # Robust gegen Locks
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=4000;")  # 4s
+    return conn
+
 # ---------------- HINTERGRUND: DB + WORKER ----------------
 def init_db(conn: sqlite3.Connection):
     c = conn.cursor()
@@ -123,7 +132,6 @@ def init_db(conn: sqlite3.Connection):
             "VALUES (1, 0, ?, 0, 0, 0, 600, 0.02, 0.80)",
             ("10109812-01",)
         )
-    conn.commit()
 
 def control_get(conn):
     c = conn.cursor()
@@ -147,18 +155,15 @@ def control_update(conn, **kwargs):
     sets = ", ".join([f"{k}=?" for k in kwargs.keys()])
     vals = list(kwargs.values()) + [1]
     conn.execute(f"UPDATE control SET {sets} WHERE id=?", vals)
-    conn.commit()
 
 def db_save_measurement(conn, row):
     conn.execute("INSERT INTO measurements VALUES (?,?,?,?,?,?,?)", (
         row["ts"], row["equipment_id"], row["temperature_c"], row["vibration_rms"],
         row["current_a"], row["voltage_v"], row["fan_rpm"]
     ))
-    conn.commit()
 
 def db_save_alarm(conn, ts, eq, level, msg):
     conn.execute("INSERT INTO alarms VALUES (?,?,?,?)", (ts, eq, level, msg))
-    conn.commit()
 
 def db_load_measurements(conn, limit=2000, eq_id=None):
     q = "SELECT ts, equipment_id, temperature_c, vibration_rms, current_a, voltage_v, fan_rpm FROM measurements"
@@ -171,7 +176,6 @@ def db_load_measurements(conn, limit=2000, eq_id=None):
     df = pd.read_sql(q, conn, params=params)
     if df.empty:
         return df
-    # chronologisch sortieren und ts -> datetime (WICHTIG für Live-Charts)
     df = df.iloc[::-1].reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"])
     return df
@@ -228,35 +232,53 @@ def sim_ml_anomaly(conn, eq_id, window, contamination):
     score = (raw_last - lo) / (hi - lo)
     return float(score)
 
-def background_worker(conn: sqlite3.Connection, stop_evt: threading.Event):
+def background_worker(stop_evt: threading.Event, db_path: str):
+    # Eigene Connection für den Worker (verhindert UI-Kollisionen)
+    conn = open_db(db_path)
+    init_db(conn)
     t = 0
     while not stop_evt.is_set():
-        ctrl = control_get(conn)
-        if ctrl["running"] == 1:
-            eq_id = ctrl["eq_id"] or "10109812-01"
-            faults = {"cooling": bool(ctrl["fault_cooling"]), "fan": bool(ctrl["fault_fan"]), "voltage": bool(ctrl["fault_voltage"])}
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            vals = sim_generate_sample(eq_id, t, faults)
-            row = {"ts": ts, "equipment_id": eq_id, **vals}
-            db_save_measurement(conn, row)
-            sim_check_thresholds(conn, eq_id, vals, ts)
-            score = sim_ml_anomaly(conn, eq_id, window=ctrl["ml_window"], contamination=ctrl["ml_cont"])
-            if score is not None:
-                if score >= ctrl["ml_alert"]:
-                    db_save_alarm(conn, ts, eq_id, "ALERT", f"ML anomaly score={score:.2f}")
-                elif score >= (ctrl["ml_alert"] * 0.7):
-                    db_save_alarm(conn, ts, eq_id, "WARN", f"ML anomaly score={score:.2f}")
-            t += 1
-        time.sleep(1)
+        try:
+            ctrl = control_get(conn)
+            if ctrl["running"] == 1:
+                eq_id = ctrl["eq_id"] or "10109812-01"
+                faults = {
+                    "cooling": bool(ctrl["fault_cooling"]),
+                    "fan": bool(ctrl["fault_fan"]),
+                    "voltage": bool(ctrl["fault_voltage"])
+                }
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                vals = sim_generate_sample(eq_id, t, faults)
+                row = {"ts": ts, "equipment_id": eq_id, **vals}
+                db_save_measurement(conn, row)
+                sim_check_thresholds(conn, eq_id, vals, ts)
+                score = sim_ml_anomaly(conn, eq_id, window=ctrl["ml_window"], contamination=ctrl["ml_cont"])
+                if score is not None:
+                    if score >= ctrl["ml_alert"]:
+                        db_save_alarm(conn, ts, eq_id, "ALERT", f"ML anomaly score={score:.2f}")
+                    elif score >= (ctrl["ml_alert"] * 0.7):
+                        db_save_alarm(conn, ts, eq_id, "WARN", f"ML anomaly score={score:.2f}")
+                t += 1
+            time.sleep(1)
+        except sqlite3.OperationalError:
+            # Kurz warten und weiter (WAL + busy_timeout sollten es ohnehin meist abfangen)
+            time.sleep(0.05)
+            continue
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 @st.cache_resource
 def get_db_and_worker():
-    conn = sqlite3.connect("data.db", check_same_thread=False)
-    init_db(conn)
+    # UI-Connection
+    ui_conn = open_db("data.db")
+    init_db(ui_conn)
+    # Worker separat starten
     stop_evt = threading.Event()
-    thread = threading.Thread(target=background_worker, args=(conn, stop_evt), daemon=True)
+    thread = threading.Thread(target=background_worker, args=(stop_evt, "data.db"), daemon=True)
     thread.start()
-    return conn, stop_evt
+    return ui_conn, stop_evt
 
 # starte DB + Worker genau einmal pro Server-Prozess
 DB_CONN, _STOP = get_db_and_worker()
@@ -322,7 +344,6 @@ with tab_settings:
         if st.button("🗑️ Daten löschen", help="Löscht NUR Simulationsdaten & Alarmfeed. Einstellungen bleiben erhalten."):
             DB_CONN.execute("DELETE FROM measurements")
             DB_CONN.execute("DELETE FROM alarms")
-            DB_CONN.commit()
             st.session_state.df = st.session_state.df.iloc[0:0]
             st.session_state.alarms = []
             st.success("Daten & Alarme gelöscht. Einstellungen unverändert.")
@@ -330,14 +351,19 @@ with tab_settings:
     st.markdown("---")
 
     st.subheader("Fault Injection (während des Laufs umschaltbar)")
+    # SOFORT wirksam: direkt ins control schreiben (kein Debounce gewünscht)
     c1, c2, c3 = st.columns(3)
-    with c1: st.session_state.faults["cooling"] = st.checkbox("Cooling Degradation — Temperatur steigt", value=bool(ctrl_now["fault_cooling"]))
-    with c2: st.session_state.faults["fan"]     = st.checkbox("Fan Wear — Lüfter RPM sinkt", value=bool(ctrl_now["fault_fan"]))
-    with c3: st.session_state.faults["voltage"] = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen", value=bool(ctrl_now["fault_voltage"]))
+    with c1:
+        cooling_cb = st.checkbox("Cooling Degradation — Temperatur steigt", value=bool(ctrl_now["fault_cooling"]))
+    with c2:
+        fan_cb = st.checkbox("Fan Wear — Lüfter RPM sinkt", value=bool(ctrl_now["fault_fan"]))
+    with c3:
+        volt_cb = st.checkbox("Voltage Spikes — sporadische Spannungsspitzen", value=bool(ctrl_now["fault_voltage"]))
+
     control_update(DB_CONN,
-                   fault_cooling=1 if st.session_state.faults["cooling"] else 0,
-                   fault_fan=1 if st.session_state.faults["fan"] else 0,
-                   fault_voltage=1 if st.session_state.faults["voltage"] else 0,
+                   fault_cooling=1 if cooling_cb else 0,
+                   fault_fan=1 if fan_cb else 0,
+                   fault_voltage=1 if volt_cb else 0,
                    eq_id=st.session_state.eq_num)
 
     st.markdown("---")
@@ -371,32 +397,40 @@ with tab_settings:
     )
 
     st.markdown("---")
-    st.subheader("KI-Anomalie (IsolationForest)")
-    st.markdown(
-        """
-**Fensterprinzip (Bewertung):**
-- Die KI betrachtet ein Fenster der letzten Messwerte (z. B. 600).
-- Jeder Messwert besteht aus Temperatur, Strom, Spannung, Vibration und Lüfter.
-- Aus den 599 vergangenen Punkten lernt sie das **normale Verhalten**.
-- Den neuesten (600.) vergleicht sie damit:
-  - passt er ins Muster → **normal**
-  - weicht er stark ab → **Anomalie**
+    st.subheader("KI-Anomalie (IsolationForest) – mit Übernehmen-Button")
 
-**IsolationForest-Erklärung:**
-- **Name:** „Isolation“ = etwas isolieren, „Forest“ = viele kleine Entscheidungsbäume (wie ein Wald).
-- **Idee:** Statt Gemeinsamkeiten zu suchen, trennt der Algorithmus ungewöhnliche Punkte möglichst schnell ab.
-- Er baut viele zufällige Entscheidungsbäume („Forest“).
-- Jeder Baum trennt die Daten nach Zufallsregeln (z. B. „Temperatur < 50 °C?“ → Ja/Nein).
-- **Normale Werte** brauchen viele Trennschritte, bis sie isoliert sind.
-- **Ausreißer** werden sehr schnell isoliert → weil sie nicht ins Muster passen.
-"""
-    )
+    # --- STAGING der ML-Parameter (keine Live-Writes beim Sliden) ---
+    ctrl_now = control_get(DB_CONN)
+    if "ml_window_tmp" not in st.session_state:
+        st.session_state.ml_window_tmp = int(ctrl_now["ml_window"])
+    if "ml_cont_tmp" not in st.session_state:
+        st.session_state.ml_cont_tmp = float(ctrl_now["ml_cont"])
+    if "ml_alert_tmp" not in st.session_state:
+        st.session_state.ml_alert_tmp = float(ctrl_now["ml_alert"])
+
     c1, c2, c3 = st.columns(3)
-    window = c1.slider("Fenstergröße (Punkte)", 200, 2000, ctrl_now["ml_window"], 50, key="ml_window")
-    contamination = c2.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, float(ctrl_now["ml_cont"]), 0.001, key="ml_cont")
-    ml_alert_thresh = c3.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, float(ctrl_now["ml_alert"]), 0.05, key="ml_thresh")
-    control_update(DB_CONN, ml_window=int(window), ml_cont=float(contamination), ml_alert=float(ml_alert_thresh))
+    with c1:
+        st.session_state.ml_window_tmp = st.slider("Fenstergröße (Punkte)", 200, 2000, int(st.session_state.ml_window_tmp), 50, key="ml_window_tmp_slider")
+    with c2:
+        st.session_state.ml_cont_tmp = st.slider("Kontamination (erwartete Ausreißer)", 0.001, 0.10, float(st.session_state.ml_cont_tmp), 0.001, key="ml_cont_tmp_slider")
+    with c3:
+        st.session_state.ml_alert_tmp = st.slider("ML-Alert-Schwelle (0–1)", 0.10, 0.90, float(st.session_state.ml_alert_tmp), 0.05, key="ml_alert_tmp_slider")
 
+    ucol1, ucol2 = st.columns([1,3])
+    with ucol1:
+        if st.button("✅ Übernehmen", use_container_width=True):
+            control_update(
+                DB_CONN,
+                ml_window=int(st.session_state.ml_window_tmp),
+                ml_cont=float(st.session_state.ml_cont_tmp),
+                ml_alert=float(st.session_state.ml_alert_tmp),
+            )
+            st.success("ML-Parameter übernommen.")
+            # Kein rerun nötig; Hintergrund greift neue Werte im nächsten Tick auf.
+    with ucol2:
+        st.caption(f"Aktive Werte: window={ctrl_now['ml_window']}, contamination={ctrl_now['ml_cont']:.3f}, alert={ctrl_now['ml_alert']:.2f}")
+
+    # Live-Status-Anzeige
     ctrl_now2 = control_get(DB_CONN)
     if ctrl_now2["running"] == 1:
         status_placeholder.success("RUNNING – Hintergrund-Simulation aktiv")
@@ -494,7 +528,6 @@ with tab_live:
     st.subheader("Live Charts")
     df_live = db_load_measurements(DB_CONN, eq_id=st.session_state.eq_num, limit=2000)
     if len(df_live):
-        # ts ist jetzt datetime -> saubere Zeitachse
         st.line_chart(df_live.set_index("ts")[METRICS], use_container_width=True)
     else:
         st.info("Noch keine Daten.")
